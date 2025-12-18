@@ -42,7 +42,10 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
         raw_text = page.get("text", "") or ""
         has_text = bool(raw_text.strip())
 
-        language = detect_language(raw_text) if has_text else "unknown"
+        lang_obj = detect_language(raw_text) if has_text else None
+        language = lang_obj["language"] if isinstance(lang_obj, dict) else "unknown"
+        language_conf = lang_obj.get("confidence", 1.0) if isinstance(lang_obj, dict) else 1.0
+
 
         page_chunks: List[Dict] = []
 
@@ -53,7 +56,7 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
             page_obj = {
                 "doc_id": doc_id,              # ✅ REQUIRED
                 "page_number": page_number,
-                "source": pdf_path,
+                "source": pdf_path, 
                 "content": raw_text.strip(),
                 "content_type": "text",
                 "language": language,
@@ -98,7 +101,7 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
                 page_obj = {
                     "doc_id": doc_id,          # ✅ REQUIRED
                     "page_number": page_number,
-                    "source": pdf_path,
+                    "source": pdf_path, 
                     "content": "\n".join(ocr_text_blocks),
                     "content_type": "ocr",
                     "language": language,
@@ -154,8 +157,9 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
             meta.setdefault("chunk_id", f"{doc_id}_page_{page_number}")
             meta.setdefault("page", page_number)
             meta.setdefault("source", pdf_path)
-            meta.setdefault("language", language)
-            meta.setdefault("confidence", 1.0)
+            meta.setdefault("language", language)          # string only
+            meta.setdefault("language_confidence", round(language_conf, 3))
+            meta.setdefault("confidence", meta.get("confidence", 1.0))
             meta.setdefault("content_type", "text")
             meta.setdefault("source_type", source_type)
 

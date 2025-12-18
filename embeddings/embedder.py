@@ -3,13 +3,12 @@
 from typing import List, Dict
 import torch
 from sentence_transformers import SentenceTransformer
-import numpy as np
 
 
 # ---------------- CONFIG ----------------
 
-EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
-EMBEDDING_VERSION = "bge_v1"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_VERSION = "minilm_v1"
 BATCH_SIZE = 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -36,17 +35,20 @@ class Embedder:
         """
         Embed a list of chunks.
 
-        Input chunk format:
+        Expected input chunk format:
         {
             "text": str,
-            "metadata": {...}
+            "metadata": {
+                "chunk_id": str,
+                ...
+            }
         }
 
         Output record format:
         {
-            "id": chunk_id,
+            "id": str,
             "vector": List[float],
-            "metadata": {...}
+            "metadata": Dict
         }
         """
 
@@ -55,7 +57,10 @@ class Embedder:
         # ---- sanity filter ----
         valid_chunks = [
             c for c in chunks
-            if c.get("text") and c.get("metadata", {}).get("chunk_id")
+            if isinstance(c.get("text"), str)
+            and c["text"].strip()
+            and isinstance(c.get("metadata"), dict)
+            and c["metadata"].get("chunk_id")
         ]
 
         if not valid_chunks:
@@ -71,7 +76,7 @@ class Embedder:
                 embeddings = self.model.encode(
                     batch_texts,
                     convert_to_numpy=True,
-                    normalize_embeddings=True,  # CRITICAL
+                    normalize_embeddings=True,
                     show_progress_bar=False
                 )
 
@@ -80,13 +85,15 @@ class Embedder:
                 meta = chunk["metadata"]
 
                 records.append({
-                    "id": meta["chunk_id"],           # deterministic ID
-                    "vector": vector.tolist(),        # normalized
+                    "id": meta["chunk_id"],
+                    "vector": vector.tolist(),
                     "metadata": {
                         **meta,
+                        "text": chunk["text"],   # ✅ THIS IS THE FIX
                         "embedding_version": EMBEDDING_VERSION,
                         "embedding_model": EMBEDDING_MODEL_NAME
                     }
                 })
+
 
         return records

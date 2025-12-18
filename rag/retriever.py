@@ -131,11 +131,7 @@ class Retriever:
                 ) or []
             )
 
-        keyword = self.vector_store.keyword_query(
-            query=query,
-            top_k=OVERFETCH_K,
-            filters=filters
-        ) or []
+        keyword = []
 
         if not dense and not keyword:
             return {"chunks": [], "diagnostics": {"reason": "no_matches"}}
@@ -165,8 +161,9 @@ class Retriever:
                 "source": meta.get("source"),
                 "page": meta.get("page"),
                 "confidence": meta.get("confidence"),
-                "text": meta["text"]
+                "text": meta.get("text", "")    # ✅ SAFE
             })
+
 
         if not ranked:
             return {"chunks": [], "diagnostics": {"reason": "low_quality"}}

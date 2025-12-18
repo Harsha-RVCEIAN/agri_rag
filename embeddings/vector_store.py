@@ -1,8 +1,13 @@
 # embeddings/vector_store.py
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from typing import List, Dict, Optional
-import pinecone
 import os
+import time
+
+from pinecone import Pinecone, ServerlessSpec
 
 
 # ---------------- CONFIG ----------------
@@ -11,7 +16,8 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV", "us-east-1")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "agri-rag")
 
-EMBEDDING_DIM = 1024   # bge-large-en-v1.5
+# MiniLM embedding dimension
+EMBEDDING_DIM = 384
 METRIC = "cosine"
 
 
@@ -32,19 +38,27 @@ class VectorStore:
         if not PINECONE_API_KEY:
             raise ValueError("PINECONE_API_KEY not set")
 
-        pinecone.init(
-            api_key=PINECONE_API_KEY,
-            environment=PINECONE_ENV
-        )
+        self.pc = Pinecone(api_key=PINECONE_API_KEY)
 
-        if INDEX_NAME not in pinecone.list_indexes():
-            pinecone.create_index(
+        # ---- create index if missing ----
+        existing_indexes = [idx["name"] for idx in self.pc.list_indexes()]
+
+        if INDEX_NAME not in existing_indexes:
+            self.pc.create_index(
                 name=INDEX_NAME,
                 dimension=EMBEDDING_DIM,
-                metric=METRIC
+                metric=METRIC,
+                spec=ServerlessSpec(
+                    cloud="aws",
+                    region=PINECONE_ENV
+                )
             )
 
-        self.index = pinecone.Index(INDEX_NAME)
+            # wait until index is ready
+            while not self.pc.describe_index(INDEX_NAME).status["ready"]:
+                time.sleep(1)
+
+        self.index = self.pc.Index(INDEX_NAME)
 
     # ---------------- UPSERT ----------------
 
@@ -98,8 +112,6 @@ class VectorStore:
     ) -> List[Dict]:
         """
         Query vector store with optional metadata filters.
-
-        Returns Pinecone matches with metadata.
         """
 
         response = self.index.query(

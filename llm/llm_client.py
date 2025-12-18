@@ -5,54 +5,58 @@ import logging
 
 class LLMClient:
     """
-    Local LLM client using HuggingFace transformers.
-    Responsibilities:
-    - Accept final prompt
-    - Call model safely
-    - Return raw text
+    Optimized LLM client using HuggingFace pipeline.
+    - CPU friendly
+    - Fast (seconds)
+    - RAG-safe
+    - Keeps existing project interface
     """
 
     def __init__(
         self,
-        model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
-        max_input_tokens: int = 4096
+        model_name: str = "google/flan-t5-base",
+        max_input_tokens: int = 1024,
+        max_output_tokens: int = 256
     ):
         self.model_name = model_name
         self.max_input_tokens = max_input_tokens
+        self.max_output_tokens = max_output_tokens
 
-        # ---- device & dtype safety ----
-        if torch.cuda.is_available():
-            device_map = "auto"
-            dtype = torch.float16
-        else:
-            device_map = "cpu"
-            dtype = torch.float32
+        # ---- device selection ----
+        # pipeline uses device index: -1 = CPU, >=0 = GPU
+        device = 0 if torch.cuda.is_available() else -1
 
+        # ---- CORRECT pipeline for FLAN-T5 ----
         self.pipe = pipeline(
-            "text-generation",
+            task="text2text-generation",
             model=self.model_name,
-            torch_dtype=dtype,
-            device_map=device_map
+            device=device
         )
 
-        # tokenizer reference for length checks
         self.tokenizer = self.pipe.tokenizer
 
     # ---------- INTERNAL UTILS ----------
 
-    def _truncate_prompt(self, prompt: str) -> str:
+    def _truncate_prompt(self, text: str) -> str:
         """
-        Hard truncate prompt to model context window.
-        Prevents silent context loss.
+        Truncate input safely for encoder-decoder models.
         """
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        tokens = self.tokenizer.encode(
+            text,
+            truncation=True,
+            max_length=self.max_input_tokens
+        )
+        return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
-        if len(tokens) <= self.max_input_tokens:
-            return prompt
+    def _build_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        FLAN-T5 expects instruction-style prompts, not chat tokens.
+        """
+        return f"""
+{system_prompt}
 
-        # keep the last part (context + question is more important than headers)
-        truncated_tokens = tokens[-self.max_input_tokens :]
-        return self.tokenizer.decode(truncated_tokens)
+{user_prompt}
+""".strip()
 
     # ---------- MAIN GENERATION ----------
 
@@ -60,32 +64,22 @@ class LLMClient:
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.0,
-        max_tokens: int = 400
+        temperature: float = 0.0,   # kept for compatibility (ignored)
+        max_tokens: int = 400       # kept for compatibility (overridden)
     ) -> str:
         """
         Generate response from LLM.
         Returns raw assistant text.
         """
 
-        prompt = (
-            "<s>[SYSTEM]\n"
-            f"{system_prompt}\n\n"
-            "[USER]\n"
-            f"{user_prompt}\n\n"
-            "[ASSISTANT]\n"
-        )
-
+        prompt = self._build_prompt(system_prompt, user_prompt)
         prompt = self._truncate_prompt(prompt)
 
         try:
             output = self.pipe(
                 prompt,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                do_sample=False,
-                return_full_text=False,
-                pad_token_id=self.tokenizer.eos_token_id
+                max_new_tokens=min(max_tokens, self.max_output_tokens),
+                do_sample=False
             )
 
             return output[0]["generated_text"].strip()
@@ -94,6 +88,6 @@ class LLMClient:
             logging.error("CUDA OOM during LLM generation")
             return "Not found in the provided documents."
 
-        except Exception as e:
+        except Exception:
             logging.exception("LLM generation failed")
             return "Not found in the provided documents."

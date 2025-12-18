@@ -7,8 +7,20 @@ Purpose:
 - Verify retriever + reranker bias is working correctly
 """
 
+import sys
+import os
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from ingestion.pipeline import ingest_pdf
 from rag.pipeline import RAGPipeline
 
+def test_ingest_produces_chunks():
+    chunks = ingest_pdf("data/pdfs/rice_cultivation.pdf")
+    print("CHUNKS:", chunks)
+    assert len(chunks) > 0, "Ingestion returned ZERO chunks"
 
 NUMERIC_TABLE_QUESTIONS = [
     "What is the urea dosage for rice at tillering stage?",
