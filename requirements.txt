@@ -1,0 +1,32 @@
+# ---------------- Core Python ----------------
+numpy
+typing-extensions
+
+# ---------------- PDF Processing ----------------
+pdfplumber
+PyMuPDF
+
+# ---------------- OCR ----------------
+opencv-python
+pytesseract
+Pillow
+
+# ---------------- Language Detection ----------------
+langdetect
+
+# ---------------- Embeddings ----------------
+torch
+transformers
+sentence-transformers
+
+# ---------------- Vector Database ----------------
+pinecone-client
+
+# ---------------- Backend / API ----------------
+fastapi
+uvicorn
+pydantic
+
+# ---------------- Utilities ----------------
+python-dotenv
+tqdm
