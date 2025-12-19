@@ -95,17 +95,28 @@ def split_questions(text: str) -> List[str]:
 # ---------------- SAFE GEMINI FALLBACK ----------------
 
 def safe_gemini_answer(question: str) -> str:
-    answer = app.state.gemini_llm.generate(
-        system_prompt=(
-            "You are an agricultural expert. "
-            "Answer in 2–3 clear sentences. "
-            "Do NOT mention documents or AI systems."
-        ),
-        user_prompt=question,
-        temperature=0.2,
-        max_tokens=200,
-    )
-    return answer.strip() or "No reliable agricultural answer could be generated."
+    try:
+        answer = app.state.gemini_llm.generate(
+            system_prompt=(
+                "You are an agricultural expert.\n"
+                "Answer ONLY the question asked.\n"
+                "Be specific and practical.\n"
+                "Do NOT mention AI, documents, or sources."
+            ),
+            user_prompt=question,
+            temperature=0.3,
+            max_tokens=220,
+        )
+
+        if answer and len(answer.split()) >= 8:
+            return answer.strip()
+
+    except Exception as e:
+        print("⚠️ Gemini error:", e)
+
+    # LAST RESORT (only if Gemini is down)
+    return "Unable to generate a response at the moment. Please try again."
+
 
 # ---------------- UTILS ----------------
 

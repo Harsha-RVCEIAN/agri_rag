@@ -6,31 +6,36 @@ from typing import Optional
 import torch
 from transformers import pipeline
 
-# Gemini (optional)
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+# ✅ NEW Gemini SDK (REQUIRED)
+from google import genai
+from google.genai import types
 
 
 class LLMClient:
     """
-    Unified LLM client.
+    Unified LLM client (STRICT ROLE SEPARATION).
 
-    Local model is used ONLY for:
-    - summarization
-    - grounded extraction
+    LOCAL (FLAN-T5):
+        - Summarization
+        - Grounded extraction
+        - RAG answers ONLY
 
-    Gemini is used for:
-    - fallback general knowledge
+    GEMINI:
+        - Fallback
+        - General agricultural knowledge
+        - Definitions (e.g., organic farming)
     """
+
+    # -------------------------------------------------
+    # INIT
+    # -------------------------------------------------
 
     def __init__(
         self,
         local_model: str = "google/flan-t5-base",
         max_input_tokens: int = 1024,
-        max_output_tokens: int = 200,
-        provider: str = "local"   # "local" or "gemini"
+        max_output_tokens: int = 256,
+        provider: str = "local",  # "local" | "gemini"
     ):
         self.provider = provider
         self.max_input_tokens = max_input_tokens
@@ -38,6 +43,7 @@ class LLMClient:
 
         self.pipe = None
         self.tokenizer = None
+        self.gemini_client = None
 
         # ---------------- LOCAL MODEL ----------------
         if self.provider == "local":
@@ -45,20 +51,20 @@ class LLMClient:
             self.pipe = pipeline(
                 task="text2text-generation",
                 model=local_model,
-                device=device
+                device=device,
             )
             self.tokenizer = self.pipe.tokenizer
 
         # ---------------- GEMINI ----------------
-        self.gemini_model = None
-        if self.provider == "gemini":
+        elif self.provider == "gemini":
             api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key or not genai:
-                logging.warning("Gemini disabled (missing key or package)")
-                self.provider = "disabled"
-            else:
-                genai.configure(api_key=api_key)
-                self.gemini_model = genai.GenerativeModel("gemini-pro")
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY not set")
+
+            self.gemini_client = genai.Client(api_key=api_key)
+
+        else:
+            raise ValueError(f"Unknown provider: {self.provider}")
 
     # -------------------------------------------------
     # UTILS
@@ -68,22 +74,21 @@ class LLMClient:
         tokens = self.tokenizer.encode(
             text,
             truncation=True,
-            max_length=self.max_input_tokens
+            max_length=self.max_input_tokens,
         )
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
     def _dedupe_repetition(self, text: str) -> str:
         """
-        Removes repeated sentence loops produced by T5.
-        This is CRITICAL.
+        HARD FIX for FLAN-T5 looping garbage.
         """
-        sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = re.split(r"(?<=[.!?])\s+", text)
         seen = set()
         clean = []
 
         for s in sentences:
             key = s.strip().lower()
-            if len(key) < 10:
+            if len(key) < 8:
                 continue
             if key in seen:
                 continue
@@ -93,24 +98,28 @@ class LLMClient:
         return " ".join(clean)
 
     # -------------------------------------------------
-    # GENERATION
+    # GENERATE
     # -------------------------------------------------
 
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.0,
-        max_tokens: Optional[int] = None
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
     ) -> str:
+        """
+        Generate text using selected provider.
+        NEVER raises to API layer.
+        """
 
-        # ---------- LOCAL (FLAN-T5) ----------
+        # ================= LOCAL (FLAN-T5) =================
         if self.provider == "local":
             try:
-                # 🔑 CRITICAL: T5 needs explicit summarization instruction
+                # 🔑 FLAN needs explicit instruction
                 prompt = (
-                    "Summarize the following agricultural information clearly "
-                    "without repeating sentences.\n\n"
+                    "Summarize the following agricultural information clearly.\n"
+                    "Do not repeat sentences.\n\n"
                     f"{system_prompt}\n\n"
                     f"{user_prompt}"
                 )
@@ -121,33 +130,42 @@ class LLMClient:
                     prompt,
                     max_new_tokens=min(
                         max_tokens or self.max_output_tokens,
-                        self.max_output_tokens
+                        self.max_output_tokens,
                     ),
                     do_sample=False,
-                    repetition_penalty=1.2,   # 🔑 critical
-                    num_beams=4               # 🔑 critical
+                    repetition_penalty=1.25,
+                    num_beams=4,
                 )
 
                 text = output[0]["generated_text"].strip()
                 return self._dedupe_repetition(text)
 
-            except Exception:
-                logging.exception("Local LLM failed")
+            except Exception as e:
+                logging.exception("❌ Local LLM failed")
                 return ""
 
-        # ---------- GEMINI ----------
-        if self.provider == "gemini" and self.gemini_model:
+        # ================= GEMINI =================
+        if self.provider == "gemini":
             try:
-                response = self.gemini_model.generate_content(
-                    f"{system_prompt}\n\n{user_prompt}",
-                    generation_config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens or self.max_output_tokens
-                    }
+                response = self.gemini_client.models.generate_content(
+                    model="gemini-1.5-flash",
+                    contents=f"{system_prompt}\n\n{user_prompt}",
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_tokens or self.max_output_tokens,
+                    ),
                 )
-                return response.text.strip()
-            except Exception:
-                logging.exception("Gemini failed")
+
+                text = response.text.strip()
+
+                # HARD SAFETY: Gemini must answer properly
+                if len(text.split()) < 6:
+                    return ""
+
+                return text
+
+            except Exception as e:
+                logging.exception("❌ Gemini failed")
                 return ""
 
         return ""
