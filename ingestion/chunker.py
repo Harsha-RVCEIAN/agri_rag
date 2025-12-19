@@ -5,16 +5,15 @@ import re
 import hashlib
 
 
-# ---------- CONFIG (soft constraints, NOT goals) ----------
-MAX_TOKENS_SOFT = 300        # approximate, not strict
-MIN_CHARS = 40               # ignore garbage
-OCR_MAX_CHARS = 180          # OCR chunks must be smaller
+# ---------- CONFIG ----------
+MAX_TOKENS_SOFT = 300
+MIN_CHARS = 40
+OCR_MAX_CHARS = 220   # slightly higher to preserve meaning
 
 
 # ---------- UTILS ----------
 def _approx_token_count(text: str) -> int:
-    # rough heuristic: 1 token ≈ 4 chars
-    return len(text) // 4
+    return max(1, len(text) // 4)
 
 
 def _normalize_text(text: str) -> str:
@@ -23,52 +22,46 @@ def _normalize_text(text: str) -> str:
 
 
 def _stable_chunk_id(doc_id: str, page: int, section: str, index: int) -> str:
-    raw = f"{doc_id}_{page}_{section}_{index}"
+    raw = f"{doc_id}|{page}|{section}|{index}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
 # ---------- SEMANTIC SPLITTERS ----------
-LOGICAL_SPLITS = [
-    r"\bhowever\b",
-    r"\bexcept\b",
-    r"\bprovided that\b",
-    r"\bnote:\b",
-    r"\bimportant:\b",
+LOGICAL_PIVOTS = [
+    "however",
+    "except",
+    "provided that",
+    "note:",
+    "important:",
 ]
 
 
 def _split_logical_units(text: str) -> List[str]:
     """
-    Split text by logical pivots, not size.
+    Split text so that logical pivots START new chunks.
     """
-    units = [text]
-    for pattern in LOGICAL_SPLITS:
-        temp = []
-        for u in units:
-            temp.extend(re.split(f"({pattern})", u, flags=re.IGNORECASE))
-        units = temp
+    pattern = r"(?i)\b(" + "|".join(LOGICAL_PIVOTS) + r")\b"
+    parts = re.split(pattern, text)
 
-    merged = []
+    units = []
     buffer = ""
-    for u in units:
-        if re.match("|".join(LOGICAL_SPLITS), u, flags=re.IGNORECASE):
-            buffer += " " + u
+
+    for part in parts:
+        if part.lower() in LOGICAL_PIVOTS:
+            if buffer.strip():
+                units.append(buffer.strip())
+            buffer = part
         else:
-            if buffer:
-                merged.append(buffer.strip())
-            buffer = u
+            buffer += " " + part
 
     if buffer.strip():
-        merged.append(buffer.strip())
+        units.append(buffer.strip())
 
-    return [u for u in merged if len(u.strip()) >= MIN_CHARS]
+    return [u for u in units if len(u) >= MIN_CHARS]
 
 
 def _split_procedure_steps(text: str) -> List[str]:
-    """
-    One step = one chunk.
-    """
-    steps = re.split(r"\n\s*\d+[\).\s]", text)
+    steps = re.split(r"\n?\s*\d+[\).\s]", text)
     return [s.strip() for s in steps if len(s.strip()) >= MIN_CHARS]
 
 
@@ -81,56 +74,62 @@ def _split_paragraphs(text: str) -> List[str]:
 def chunk_page(page: Dict) -> List[Dict]:
     """
     Meaning-first chunker.
-    Produces atomic, metadata-rich chunks.
+    Produces stable, relevance-friendly chunks.
     """
 
     text = _normalize_text(page["content"])
     content_type = page["content_type"]
-    confidence = page.get("confidence", 1.0)
 
     doc_id = page["doc_id"]
     page_no = page["page_number"]
-    section = page.get("section", "unknown")
 
-    chunks = []
-    chunk_index = 0
+    # Better section inference
+    section = page.get("section") or content_type
 
-    # ---------- PROCEDURES ----------
+    units: List[str] = []
+
+    # ---------- PROCEDURE ----------
     if content_type == "procedure":
         units = _split_procedure_steps(text)
 
     # ---------- OCR ----------
     elif content_type == "ocr":
-        units = _split_paragraphs(text)
-        units = [u for u in units if len(u) <= OCR_MAX_CHARS]
+        paras = _split_paragraphs(text)
+        units = []
+        for p in paras:
+            if len(p) <= OCR_MAX_CHARS:
+                units.append(p)
+            else:
+                units.extend(
+                    re.split(r"(?<=[.!?])\s+", p)
+                )
 
     # ---------- NORMAL TEXT ----------
     else:
         paras = _split_paragraphs(text)
-        units = []
         for p in paras:
             units.extend(_split_logical_units(p))
 
     # ---------- BUILD CHUNKS ----------
+    chunks: List[Dict] = []
+    index = 0
+
     for unit in units:
-        token_estimate = _approx_token_count(unit)
-
-        if token_estimate > MAX_TOKENS_SOFT:
-            # fallback: sentence split
+        if _approx_token_count(unit) > MAX_TOKENS_SOFT:
             sentences = re.split(r"(?<=[.!?])\s+", unit)
+            buffer = ""
             for s in sentences:
-                if len(s.strip()) < MIN_CHARS:
-                    continue
-                chunks.append(_build_chunk(
-                    s, page, section, chunk_index
-                ))
-                chunk_index += 1
-            continue
-
-        chunks.append(_build_chunk(
-            unit, page, section, chunk_index
-        ))
-        chunk_index += 1
+                buffer += " " + s
+                if _approx_token_count(buffer) >= MAX_TOKENS_SOFT:
+                    chunks.append(_build_chunk(buffer.strip(), page, section, index))
+                    index += 1
+                    buffer = ""
+            if buffer.strip():
+                chunks.append(_build_chunk(buffer.strip(), page, section, index))
+                index += 1
+        else:
+            chunks.append(_build_chunk(unit, page, section, index))
+            index += 1
 
     return chunks
 
@@ -145,12 +144,12 @@ def _build_chunk(text: str, page: Dict, section: str, index: int) -> Dict:
     )
 
     return {
-        "text": text,
+        "text": text.strip(),
         "metadata": {
             "chunk_id": chunk_id,
             "doc_id": page["doc_id"],
             "source": page["source"],
-            "page_number": page["page_number"],
+            "page": page["page_number"],
             "section": section,
             "content_type": page["content_type"],
             "language": page["language"],
@@ -163,7 +162,8 @@ def _build_chunk(text: str, page: Dict, section: str, index: int) -> Dict:
 def _priority_from_type(content_type: str) -> int:
     return {
         "procedure": 5,
-        "text": 4,
         "table": 5,
+        "table_row": 5,
+        "text": 4,
         "ocr": 2
     }.get(content_type, 3)

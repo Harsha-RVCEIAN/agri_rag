@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from typing import Optional
 
 import torch
@@ -14,26 +15,31 @@ except ImportError:
 
 class LLMClient:
     """
-    Unified LLM client:
-    - Local: FLAN-T5-Base (default, always works)
-    - External: Gemini Pro (OPTIONAL fallback)
+    Unified LLM client.
+
+    Local model is used ONLY for:
+    - summarization
+    - grounded extraction
+
+    Gemini is used for:
+    - fallback general knowledge
     """
 
     def __init__(
         self,
         local_model: str = "google/flan-t5-base",
         max_input_tokens: int = 1024,
-        max_output_tokens: int = 256,
+        max_output_tokens: int = 200,
         provider: str = "local"   # "local" or "gemini"
     ):
         self.provider = provider
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
 
-        # ---------------- LOCAL (FLAN) ----------------
         self.pipe = None
         self.tokenizer = None
 
+        # ---------------- LOCAL MODEL ----------------
         if self.provider == "local":
             device = 0 if torch.cuda.is_available() else -1
             self.pipe = pipeline(
@@ -43,27 +49,22 @@ class LLMClient:
             )
             self.tokenizer = self.pipe.tokenizer
 
-        # ---------------- GEMINI (OPTIONAL) ----------------
+        # ---------------- GEMINI ----------------
         self.gemini_model = None
-
         if self.provider == "gemini":
             api_key = os.getenv("GEMINI_API_KEY")
-
             if not api_key or not genai:
-                logging.warning(
-                    "Gemini fallback requested but GEMINI_API_KEY not set. "
-                    "Fallback will be unavailable."
-                )
+                logging.warning("Gemini disabled (missing key or package)")
                 self.provider = "disabled"
             else:
                 genai.configure(api_key=api_key)
                 self.gemini_model = genai.GenerativeModel("gemini-pro")
 
     # -------------------------------------------------
-    # LOCAL UTILS
+    # UTILS
     # -------------------------------------------------
 
-    def _truncate_prompt(self, text: str) -> str:
+    def _truncate(self, text: str) -> str:
         tokens = self.tokenizer.encode(
             text,
             truncation=True,
@@ -71,11 +72,28 @@ class LLMClient:
         )
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
-    def _build_prompt(self, system_prompt: str, user_prompt: str) -> str:
-        return f"{system_prompt}\n\n{user_prompt}".strip()
+    def _dedupe_repetition(self, text: str) -> str:
+        """
+        Removes repeated sentence loops produced by T5.
+        This is CRITICAL.
+        """
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        seen = set()
+        clean = []
+
+        for s in sentences:
+            key = s.strip().lower()
+            if len(key) < 10:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(s.strip())
+
+        return " ".join(clean)
 
     # -------------------------------------------------
-    # MAIN GENERATION
+    # GENERATION
     # -------------------------------------------------
 
     def generate(
@@ -85,51 +103,51 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: Optional[int] = None
     ) -> str:
-        """
-        Generate response using selected provider.
-        """
 
-        # ---------- LOCAL (FLAN) ----------
+        # ---------- LOCAL (FLAN-T5) ----------
         if self.provider == "local":
             try:
-                prompt = self._build_prompt(system_prompt, user_prompt)
-                prompt = self._truncate_prompt(prompt)
+                # 🔑 CRITICAL: T5 needs explicit summarization instruction
+                prompt = (
+                    "Summarize the following agricultural information clearly "
+                    "without repeating sentences.\n\n"
+                    f"{system_prompt}\n\n"
+                    f"{user_prompt}"
+                )
 
-                out = self.pipe(
+                prompt = self._truncate(prompt)
+
+                output = self.pipe(
                     prompt,
                     max_new_tokens=min(
                         max_tokens or self.max_output_tokens,
                         self.max_output_tokens
                     ),
-                    do_sample=False
+                    do_sample=False,
+                    repetition_penalty=1.2,   # 🔑 critical
+                    num_beams=4               # 🔑 critical
                 )
-                return out[0]["generated_text"].strip()
+
+                text = output[0]["generated_text"].strip()
+                return self._dedupe_repetition(text)
 
             except Exception:
-                logging.exception("Local LLM generation failed")
-                return "Not found in the provided documents."
+                logging.exception("Local LLM failed")
+                return ""
 
-        # ---------- GEMINI (FALLBACK) ----------
+        # ---------- GEMINI ----------
         if self.provider == "gemini" and self.gemini_model:
             try:
-                full_prompt = (
-                    f"{system_prompt}\n\n"
-                    f"{user_prompt}\n\n"
-                    "Note: This answer is generated using a general AI model."
-                )
-
                 response = self.gemini_model.generate_content(
-                    full_prompt,
+                    f"{system_prompt}\n\n{user_prompt}",
                     generation_config={
                         "temperature": temperature,
                         "max_output_tokens": max_tokens or self.max_output_tokens
                     }
                 )
                 return response.text.strip()
-
             except Exception:
-                logging.exception("Gemini fallback failed")
-                return "Unable to generate fallback response at this time."
+                logging.exception("Gemini failed")
+                return ""
 
-        # ---------- FALLBACK DISABLED ----------
-        return "Not found in the provided documents."
+        return ""

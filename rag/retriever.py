@@ -1,56 +1,45 @@
 from typing import List, Dict, Optional
-from embeddings.embedder import Embedder
-from embeddings.vector_store import VectorStore
 
+# ---------------- CONFIG ----------------
 
 DEFAULT_TOP_K = 6
 OVERFETCH_K = 20
 
 MIN_ADJUSTED_SCORE = 0.25
 WEAK_RETRIEVAL_THRESHOLD = 0.35
+MAX_MERGED_CANDIDATES = 40  # noise guard
 
 CONTENT_TYPE_WEIGHT = {
     "table_row": 1.30,
     "procedure": 1.15,
     "text": 1.0,
-    "ocr": 0.7
+    "ocr": 0.7,
 }
 
 
 class Retriever:
+    """
+    Retriever = truth filter.
 
-    def __init__(self):
-        self.embedder = Embedder()
-        self.vector_store = VectorStore()
+    Responsibilities:
+    - Rank chunks
+    - Penalize low-confidence / OCR content
+    - Prefer tables for numeric queries
+    - Detect weak / irrelevant retrieval
 
-    # ---------- QUERY UTILS ----------
+    NOT responsible for:
+    - Embedding
+    - Answer generation
+    - Persistence
+    """
 
-    def _expand_query(self, query: str) -> List[str]:
-        q = query.lower()
-        expansions = [query]
-
-        if "scheme" in q:
-            expansions.append(f"{query} government scheme")
-
-        if "pm kisan" in q or "pm-kisan" in q:
-            expansions.append("PM-Kisan Samman Nidhi eligibility application")
-
-        if "insurance" in q:
-            expansions.append("crop insurance scheme PMFBY")
-
-        return list(set(expansions))
-
-    def _embed_queries(self, queries: List[str]) -> List[List[float]]:
-        records = [{"text": q, "metadata": {"chunk_id": "__query__"}} for q in queries]
-        embedded = self.embedder.embed_chunks(records)
-        return [r["vector"] for r in embedded]
+    def __init__(self, vector_store, embedder=None):
+        self.vector_store = vector_store
+        self.embedder = embedder  # kept for interface consistency
 
     # ---------- SCORE NORMALIZATION ----------
 
     def _normalize_scores(self, matches: List[Dict]) -> List[Dict]:
-        """
-        Normalize scores to 0–1 range to make dense + keyword comparable.
-        """
         if not matches:
             return matches
 
@@ -67,7 +56,7 @@ class Retriever:
 
         return matches
 
-    # ---------- SCORING ----------
+    # ---------- SCORE ADJUSTMENT ----------
 
     def _adjust_score(self, match: Dict, intent: Optional[str]) -> float:
         base = match.get("norm_score", match["score"])
@@ -77,18 +66,19 @@ class Retriever:
         confidence = meta.get("confidence", 1.0)
         priority = meta.get("priority", 3)
 
+        # Base weighting by content type
         score = base * CONTENT_TYPE_WEIGHT.get(content_type, 1.0)
 
-        # Global confidence penalty (not OCR-only)
+        # OCR / confidence penalties
         if confidence < 0.6:
             score *= 0.75
         if confidence < 0.4:
             score *= 0.5
 
-        # Intent bias
+        # Intent-based bias
         if intent == "eligibility" and content_type == "table_row":
             score *= 1.2
-        if intent == "procedure" and content_type == "procedure":
+        elif intent == "procedure" and content_type == "procedure":
             score *= 1.15
 
         # Priority fine-tuning
@@ -96,17 +86,20 @@ class Retriever:
 
         return score
 
-    # ---------- MAIN ----------
+    # ---------- MAIN RETRIEVAL ----------
 
     def retrieve(
         self,
         query: str,
+        query_vectors: List[List[float]],
         intent: Optional[str] = None,
         language: Optional[str] = None,
-        top_k: int = DEFAULT_TOP_K
+        top_k: int = DEFAULT_TOP_K,
     ) -> Dict:
 
+        # ---------- METADATA FILTERS ----------
         filters = {}
+
         if language:
             filters["language"] = {"$eq": language}
 
@@ -118,73 +111,86 @@ class Retriever:
             filters["content_type"] = {"$in": ["procedure", "text"]}
             top_k = min(top_k, 7)
 
-        expanded = self._expand_query(query)
-        vectors = self._embed_queries(expanded)
+        # ---------- DENSE RETRIEVAL ----------
+        dense_matches: List[Dict] = []
 
-        dense = []
-        for v in vectors:
-            dense.extend(
-                self.vector_store.query(
-                    query_vector=v,
-                    top_k=OVERFETCH_K,
-                    filters=filters
-                ) or []
+        for v in query_vectors:
+            matches = self.vector_store.query(
+                query_vector=v,
+                top_k=OVERFETCH_K,
+                filters=filters,
             )
+            if matches:
+                dense_matches.extend(matches)
 
-        keyword = []
+        if not dense_matches:
+            return {
+                "chunks": [],
+                "diagnostics": {"reason": "no_matches"},
+            }
 
-        if not dense and not keyword:
-            return {"chunks": [], "diagnostics": {"reason": "no_matches"}}
+        # ---------- NORMALIZE SCORES ----------
+        dense_matches = self._normalize_scores(dense_matches)
 
-        # ---------- normalize scores separately ----------
-        dense = self._normalize_scores(dense)
-        keyword = self._normalize_scores(keyword)
-
-        # ---------- merge ----------
-        merged = {}
-        for m in dense + keyword:
+        # ---------- MERGE (BEST MATCH PER CHUNK) ----------
+        merged: Dict[str, Dict] = {}
+        for m in dense_matches:
             cid = m["metadata"]["chunk_id"]
             if cid not in merged or merged[cid]["norm_score"] < m["norm_score"]:
                 merged[cid] = m
 
+        # ---------- NOISE GUARD (FIXED) ----------
+        # Sort BEFORE slicing to avoid random loss of good chunks
+        merged_values = sorted(
+            merged.values(),
+            key=lambda m: m["norm_score"],
+            reverse=True
+        )[:MAX_MERGED_CANDIDATES]
+
+        # ---------- ADJUST & FILTER ----------
         ranked = []
-        for m in merged.values():
-            adj = self._adjust_score(m, intent)
-            if adj < MIN_ADJUSTED_SCORE:
+        for m in merged_values:
+            adjusted = self._adjust_score(m, intent)
+            if adjusted < MIN_ADJUSTED_SCORE:
                 continue
 
             meta = m["metadata"]
             ranked.append({
                 "chunk_id": meta["chunk_id"],
-                "score": adj,
+                "score": adjusted,
                 "content_type": meta.get("content_type"),
                 "source": meta.get("source"),
                 "page": meta.get("page"),
                 "confidence": meta.get("confidence"),
-                "text": meta.get("text", "")    # ✅ SAFE
+                "text": meta.get("text", ""),
             })
 
-
         if not ranked:
-            return {"chunks": [], "diagnostics": {"reason": "low_quality"}}
+            return {
+                "chunks": [],
+                "diagnostics": {"reason": "low_quality"},
+            }
 
         ranked.sort(key=lambda x: x["score"], reverse=True)
 
+        # ---------- WEAK / IRRELEVANT RETRIEVAL ----------
         if ranked[0]["score"] < WEAK_RETRIEVAL_THRESHOLD:
             return {
                 "chunks": [],
                 "diagnostics": {
-                    "reason": "weak_retrieval",
+                    "reason": "irrelevant_query",
                     "top_score": ranked[0]["score"],
-                    "intent": intent
-                }
+                    "intent": intent,
+                },
             }
 
+        # ---------- SUCCESS ----------
         return {
             "chunks": ranked[:top_k],
             "diagnostics": {
-                "expanded_queries": expanded,
-                "returned_chunks": len(ranked),
-                "intent": intent
-            }
+                "reason": "ok",
+                "returned": len(ranked),
+                "used": top_k,
+                "intent": intent,
+            },
         }
