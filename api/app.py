@@ -92,6 +92,21 @@ def split_questions(text: str) -> List[str]:
     parts = re.split(r"\band\b|\balso\b|;", text, flags=re.I)
     return [p.strip() for p in parts if len(p.split()) > 2]
 
+# ---------------- SAFE GEMINI FALLBACK ----------------
+
+def safe_gemini_answer(question: str) -> str:
+    answer = app.state.gemini_llm.generate(
+        system_prompt=(
+            "You are an agricultural expert. "
+            "Answer in 2–3 clear sentences. "
+            "Do NOT mention documents or AI systems."
+        ),
+        user_prompt=question,
+        temperature=0.2,
+        max_tokens=200,
+    )
+    return answer.strip() or "No reliable agricultural answer could be generated."
+
 # ---------------- UTILS ----------------
 
 def _file_hash(path: str) -> str:
@@ -147,7 +162,6 @@ def chat(req: ChatRequest):
     if not raw:
         raise HTTPException(400, "Empty question")
 
-    # ---- PERSON BLOCK ----
     if looks_like_person_query(raw):
         return ChatResponse(
             answer="This system answers agriculture-related questions only.",
@@ -157,7 +171,6 @@ def chat(req: ChatRequest):
             refusal_reason="person_query"
         )
 
-    # ---- NON AGRI BLOCK ----
     if not is_agriculture_query(raw):
         return ChatResponse(
             answer="This system answers agriculture-related questions only.",
@@ -184,32 +197,15 @@ def chat(req: ChatRequest):
 
         chunks = retrieval["chunks"]
 
-        # ---- NO DOCS → GEMINI ----
         if not chunks:
-            fallback = app.state.gemini_llm.generate(
-                system_prompt=(
-                    "You are an agricultural expert. "
-                    "Answer clearly and concisely. "
-                    "Do not mention documents or AI systems."
-                ),
-                user_prompt=q,
-                temperature=0.2,
-                max_tokens=180
-            )
-            answers.append(fallback)
+            answers.append(safe_gemini_answer(q))
             confidence = max(confidence, 0.3)
             continue
 
         rag = generate_answer(q, chunks, retrieval["diagnostics"])
 
         if not rag["answer"]:
-            fallback = app.state.gemini_llm.generate(
-                system_prompt="You are an agricultural expert.",
-                user_prompt=q,
-                temperature=0.2,
-                max_tokens=180
-            )
-            answers.append(fallback)
+            answers.append(safe_gemini_answer(q))
             confidence = max(confidence, 0.3)
             continue
 
@@ -219,7 +215,7 @@ def chat(req: ChatRequest):
     return ChatResponse(
         answer="\n\n".join(answers),
         confidence=min(1.0, confidence),
-        citations=[],   # 🔒 hidden by design
+        citations=[],  # intentionally hidden
         refused=False,
     )
 
