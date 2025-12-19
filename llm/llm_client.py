@@ -1,46 +1,69 @@
-from transformers import pipeline
-import torch
+import os
 import logging
+from typing import Optional
+
+import torch
+from transformers import pipeline
+
+# Gemini (optional)
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 
 class LLMClient:
     """
-    Optimized LLM client using HuggingFace pipeline.
-    - CPU friendly
-    - Fast (seconds)
-    - RAG-safe
-    - Keeps existing project interface
+    Unified LLM client:
+    - Local: FLAN-T5-Base (default, always works)
+    - External: Gemini Pro (OPTIONAL fallback)
     """
 
     def __init__(
         self,
-        model_name: str = "google/flan-t5-base",
+        local_model: str = "google/flan-t5-base",
         max_input_tokens: int = 1024,
-        max_output_tokens: int = 256
+        max_output_tokens: int = 256,
+        provider: str = "local"   # "local" or "gemini"
     ):
-        self.model_name = model_name
+        self.provider = provider
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
 
-        # ---- device selection ----
-        # pipeline uses device index: -1 = CPU, >=0 = GPU
-        device = 0 if torch.cuda.is_available() else -1
+        # ---------------- LOCAL (FLAN) ----------------
+        self.pipe = None
+        self.tokenizer = None
 
-        # ---- CORRECT pipeline for FLAN-T5 ----
-        self.pipe = pipeline(
-            task="text2text-generation",
-            model=self.model_name,
-            device=device
-        )
+        if self.provider == "local":
+            device = 0 if torch.cuda.is_available() else -1
+            self.pipe = pipeline(
+                task="text2text-generation",
+                model=local_model,
+                device=device
+            )
+            self.tokenizer = self.pipe.tokenizer
 
-        self.tokenizer = self.pipe.tokenizer
+        # ---------------- GEMINI (OPTIONAL) ----------------
+        self.gemini_model = None
 
-    # ---------- INTERNAL UTILS ----------
+        if self.provider == "gemini":
+            api_key = os.getenv("GEMINI_API_KEY")
+
+            if not api_key or not genai:
+                logging.warning(
+                    "Gemini fallback requested but GEMINI_API_KEY not set. "
+                    "Fallback will be unavailable."
+                )
+                self.provider = "disabled"
+            else:
+                genai.configure(api_key=api_key)
+                self.gemini_model = genai.GenerativeModel("gemini-pro")
+
+    # -------------------------------------------------
+    # LOCAL UTILS
+    # -------------------------------------------------
 
     def _truncate_prompt(self, text: str) -> str:
-        """
-        Truncate input safely for encoder-decoder models.
-        """
         tokens = self.tokenizer.encode(
             text,
             truncation=True,
@@ -49,45 +72,64 @@ class LLMClient:
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
     def _build_prompt(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        FLAN-T5 expects instruction-style prompts, not chat tokens.
-        """
-        return f"""
-{system_prompt}
+        return f"{system_prompt}\n\n{user_prompt}".strip()
 
-{user_prompt}
-""".strip()
-
-    # ---------- MAIN GENERATION ----------
+    # -------------------------------------------------
+    # MAIN GENERATION
+    # -------------------------------------------------
 
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.0,   # kept for compatibility (ignored)
-        max_tokens: int = 400       # kept for compatibility (overridden)
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None
     ) -> str:
         """
-        Generate response from LLM.
-        Returns raw assistant text.
+        Generate response using selected provider.
         """
 
-        prompt = self._build_prompt(system_prompt, user_prompt)
-        prompt = self._truncate_prompt(prompt)
+        # ---------- LOCAL (FLAN) ----------
+        if self.provider == "local":
+            try:
+                prompt = self._build_prompt(system_prompt, user_prompt)
+                prompt = self._truncate_prompt(prompt)
 
-        try:
-            output = self.pipe(
-                prompt,
-                max_new_tokens=min(max_tokens, self.max_output_tokens),
-                do_sample=False
-            )
+                out = self.pipe(
+                    prompt,
+                    max_new_tokens=min(
+                        max_tokens or self.max_output_tokens,
+                        self.max_output_tokens
+                    ),
+                    do_sample=False
+                )
+                return out[0]["generated_text"].strip()
 
-            return output[0]["generated_text"].strip()
+            except Exception:
+                logging.exception("Local LLM generation failed")
+                return "Not found in the provided documents."
 
-        except torch.cuda.OutOfMemoryError:
-            logging.error("CUDA OOM during LLM generation")
-            return "Not found in the provided documents."
+        # ---------- GEMINI (FALLBACK) ----------
+        if self.provider == "gemini" and self.gemini_model:
+            try:
+                full_prompt = (
+                    f"{system_prompt}\n\n"
+                    f"{user_prompt}\n\n"
+                    "Note: This answer is generated using a general AI model."
+                )
 
-        except Exception:
-            logging.exception("LLM generation failed")
-            return "Not found in the provided documents."
+                response = self.gemini_model.generate_content(
+                    full_prompt,
+                    generation_config={
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens or self.max_output_tokens
+                    }
+                )
+                return response.text.strip()
+
+            except Exception:
+                logging.exception("Gemini fallback failed")
+                return "Unable to generate fallback response at this time."
+
+        # ---------- FALLBACK DISABLED ----------
+        return "Not found in the provided documents."

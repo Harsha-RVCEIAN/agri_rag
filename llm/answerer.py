@@ -1,24 +1,7 @@
-# llm/answerer.py
-
-from typing import List, Dict
+from typing import List, Dict, Optional
 import re
 
 from llm.llm_client import LLMClient
-
-
-# ---------------- LLM INIT ----------------
-
-llm = LLMClient()
-
-SYSTEM_PROMPT = (
-    "You are an agricultural expert assistant.\n"
-    "\n"
-    "Answer using ONLY the provided context.\n"
-    "Do NOT add information that is not present in the context.\n"
-    "\n"
-    "If the context does not contain enough information, say:\n"
-    "\"Not found in the provided documents.\""
-)
 
 
 # ---------------- CONFIG ----------------
@@ -27,45 +10,52 @@ MAX_CONTEXT_CHUNKS = 5
 MAX_CHARS_PER_CHUNK = 800
 
 
+SYSTEM_PROMPT = (
+    "You are an agricultural expert assistant.\n\n"
+    "Answer using ONLY the provided context.\n"
+    "Do NOT add information that is not present in the context.\n\n"
+    "If the context does not contain enough information, say:\n"
+    "\"Not found in the provided documents.\""
+)
+
+
+# ---------------- LLM (LAZY) ----------------
+
+_llm: Optional[LLMClient] = None
+
+
+def _get_llm() -> LLMClient:
+    global _llm
+    if _llm is None:
+        _llm = LLMClient()
+    return _llm
+
+
 # ---------------- HELPERS ----------------
 
 def _clean_text(text: str) -> str:
-    """
-    Normalize OCR / PDF text and make list-like content explicit.
-    """
     text = " ".join(text.split())
-
-    # normalize common list markers
     text = text.replace("Key Features", "Key Features:\n")
     text = text.replace(" - ", "\n- ")
-
     return text
 
 
 def _is_list_question(query: str) -> bool:
-    """
-    Detect questions that REQUIRE multi-point answers.
-    """
     q = query.lower()
     return any(
         kw in q
-        for kw in [
+        for kw in (
             "feature", "features",
             "benefit", "benefits",
             "advantages",
             "key points",
             "components"
-        ]
+        )
     )
 
 
-def _extract_bullets_from_text(text: str) -> List[str]:
-    """
-    Deterministically extract list items from text.
-    NO LLM involved.
-    """
+def _extract_bullets(text: str) -> List[str]:
     items: List[str] = []
-
     parts = re.split(r"\n-\s+|\n•\s+|- ", text)
 
     for p in parts:
@@ -78,21 +68,38 @@ def _extract_bullets_from_text(text: str) -> List[str]:
 
 # ---------------- MAIN ----------------
 
-def generate_answer(query: str, docs: List[Dict]) -> str:
+def generate_answer(
+    query: str,
+    docs: List[Dict],
+    retrieval_diagnostics: Optional[Dict] = None
+) -> Dict:
     """
-    Hybrid answer generation:
-    - Deterministic extraction for list questions
-    - LLM used ONLY for single-value / explanatory answers
+    Generates a RAG-grounded answer ONLY.
+
+    Returns structured output so the caller
+    can decide whether to fallback to an external LLM.
     """
 
+    # ---------- SAFETY GATE ----------
     if not docs:
-        return "Not found in the provided documents."
+        return {
+            "answer": "Not found in the provided documents.",
+            "grounded": False,
+            "allow_fallback": True
+        }
+
+    if retrieval_diagnostics and retrieval_diagnostics.get("weak_retrieval"):
+        return {
+            "answer": "Not found in the provided documents.",
+            "grounded": False,
+            "allow_fallback": True
+        }
 
     # =========================================================
-    # LIST / FEATURES QUESTIONS → DETERMINISTIC PATH
+    # LIST / FEATURES QUESTIONS → DETERMINISTIC
     # =========================================================
     if _is_list_question(query):
-        collected_items: List[str] = []
+        collected: List[str] = []
 
         for d in docs:
             text = d.get("text") or d.get("content", "")
@@ -100,27 +107,31 @@ def generate_answer(query: str, docs: List[Dict]) -> str:
                 continue
 
             text = _clean_text(text)
-            items = _extract_bullets_from_text(text)
-            collected_items.extend(items)
+            collected.extend(_extract_bullets(text))
 
-        # deduplicate while preserving order
+        # dedupe, preserve order
         seen = set()
-        unique_items = []
-        for i in collected_items:
+        final = []
+        for i in collected:
             if i not in seen:
                 seen.add(i)
-                unique_items.append(i)
+                final.append(i)
 
-        if unique_items:
-            return (
-                "The features include:\n"
-                + "\n".join(f"- {i}" for i in unique_items)
-            )
+        if final:
+            return {
+                "answer": "The features include:\n" + "\n".join(f"- {i}" for i in final),
+                "grounded": True,
+                "allow_fallback": False
+            }
 
-        return "Not found in the provided documents."
+        return {
+            "answer": "Not found in the provided documents.",
+            "grounded": False,
+            "allow_fallback": True
+        }
 
     # =========================================================
-    # NON-LIST QUESTIONS → LLM PATH
+    # EXPLANATORY QUESTIONS → LLM (GROUND-LOCKED)
     # =========================================================
     context_blocks = []
 
@@ -130,16 +141,19 @@ def generate_answer(query: str, docs: List[Dict]) -> str:
             continue
 
         text = _clean_text(text)[:MAX_CHARS_PER_CHUNK]
-
-        page = d.get("page", d.get("page_number", "unknown"))
         source = d.get("source", "unknown")
+        page = d.get("page", "unknown")
 
         context_blocks.append(
             f"[Source: {source}, Page: {page}]\n{text}"
         )
 
     if not context_blocks:
-        return "Not found in the provided documents."
+        return {
+            "answer": "Not found in the provided documents.",
+            "grounded": False,
+            "allow_fallback": True
+        }
 
     context = "\n\n".join(context_blocks)
 
@@ -150,14 +164,21 @@ def generate_answer(query: str, docs: List[Dict]) -> str:
         f"{query}\n\n"
         "Instructions:\n"
         "- Use ONLY the provided context.\n"
-        "- If a numeric value is clearly stated, extract it exactly.\n"
+        "- Extract facts verbatim when possible.\n"
         "- Do NOT guess.\n\n"
         "Answer:"
     )
 
-    return llm.generate(
+    llm = _get_llm()
+    answer = llm.generate(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         temperature=0.0,
         max_tokens=300
     )
+
+    return {
+        "answer": answer.strip(),
+        "grounded": True,
+        "allow_fallback": False
+    }

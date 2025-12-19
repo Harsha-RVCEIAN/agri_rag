@@ -1,5 +1,3 @@
-# embeddings/embedder.py
-
 from typing import List, Dict
 import torch
 from sentence_transformers import SentenceTransformer
@@ -19,9 +17,8 @@ class Embedder:
     """
     Responsible ONLY for:
     - loading embedding model
-    - embedding clean chunk text
+    - embedding text (chunks or queries)
     - normalizing vectors
-    - returning ready-to-upsert records
     """
 
     def __init__(self):
@@ -31,30 +28,52 @@ class Embedder:
         )
         self.model.eval()
 
+    # -------------------------------------------------
+    # INTERNAL CORE EMBEDDING
+    # -------------------------------------------------
+
+    def _embed(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+
+        vectors: List[List[float]] = []
+
+        for start in range(0, len(texts), BATCH_SIZE):
+            batch = texts[start:start + BATCH_SIZE]
+
+            with torch.no_grad():
+                embs = self.model.encode(
+                    batch,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False
+                )
+
+            vectors.extend(embs.tolist())
+
+        return vectors
+
+    # -------------------------------------------------
+    # QUERY EMBEDDING (NEW — REQUIRED)
+    # -------------------------------------------------
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed raw query texts.
+        Returns list of vectors.
+        """
+        clean_texts = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
+        return self._embed(clean_texts)
+
+    # -------------------------------------------------
+    # CHUNK EMBEDDING (EXISTING)
+    # -------------------------------------------------
+
     def embed_chunks(self, chunks: List[Dict]) -> List[Dict]:
         """
-        Embed a list of chunks.
-
-        Expected input chunk format:
-        {
-            "text": str,
-            "metadata": {
-                "chunk_id": str,
-                ...
-            }
-        }
-
-        Output record format:
-        {
-            "id": str,
-            "vector": List[float],
-            "metadata": Dict
-        }
+        Embed document chunks for vector store upsert.
         """
 
-        records: List[Dict] = []
-
-        # ---- sanity filter ----
         valid_chunks = [
             c for c in chunks
             if isinstance(c.get("text"), str)
@@ -64,36 +83,25 @@ class Embedder:
         ]
 
         if not valid_chunks:
-            return records
+            return []
 
         texts = [c["text"] for c in valid_chunks]
+        vectors = self._embed(texts)
 
-        # ---- batch embedding ----
-        for start in range(0, len(texts), BATCH_SIZE):
-            batch_texts = texts[start:start + BATCH_SIZE]
+        records: List[Dict] = []
 
-            with torch.no_grad():
-                embeddings = self.model.encode(
-                    batch_texts,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
-                )
+        for chunk, vector in zip(valid_chunks, vectors):
+            meta = chunk["metadata"]
 
-            for i, vector in enumerate(embeddings):
-                chunk = valid_chunks[start + i]
-                meta = chunk["metadata"]
-
-                records.append({
-                    "id": meta["chunk_id"],
-                    "vector": vector.tolist(),
-                    "metadata": {
-                        **meta,
-                        "text": chunk["text"],   # ✅ THIS IS THE FIX
-                        "embedding_version": EMBEDDING_VERSION,
-                        "embedding_model": EMBEDDING_MODEL_NAME
-                    }
-                })
-
+            records.append({
+                "id": meta["chunk_id"],
+                "vector": vector,
+                "metadata": {
+                    **meta,
+                    "text": chunk["text"],  # required for RAG
+                    "embedding_version": EMBEDDING_VERSION,
+                    "embedding_model": EMBEDDING_MODEL_NAME
+                }
+            })
 
         return records
