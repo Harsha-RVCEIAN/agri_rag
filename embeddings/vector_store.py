@@ -17,26 +17,22 @@ EMBEDDING_DIM = 384
 METRIC = "cosine"
 
 # HARD SAFETY GUARDS
-MIN_RAW_SCORE = 0.15        # 🔑 stop garbage matches
+MIN_RAW_SCORE = 0.22          # ↑ stricter, realistic for cosine
 UPSERT_BATCH_SIZE = 100
 
 DEFAULT_NAMESPACE = "agriculture"
+
+REQUIRED_METADATA_FIELDS = {
+    "chunk_id",
+    "content_type",
+    "source",
+}
 
 # ---------------- VECTOR STORE ----------------
 
 class VectorStore:
     """
-    Pinecone-backed vector store.
-
-    Responsibilities:
-    - Index lifecycle
-    - Safe upsert
-    - Safe query
-    - Namespace isolation
-
-    NOT responsible for:
-    - Embeddings
-    - Ranking logic
+    Pinecone-backed vector store (defensive).
     """
 
     def __init__(self):
@@ -45,9 +41,7 @@ class VectorStore:
 
         self.pc = Pinecone(api_key=PINECONE_API_KEY)
 
-        existing = self.pc.list_indexes().names()
-
-        if INDEX_NAME not in existing:
+        if INDEX_NAME not in self.pc.list_indexes().names():
             self.pc.create_index(
                 name=INDEX_NAME,
                 dimension=EMBEDDING_DIM,
@@ -57,15 +51,13 @@ class VectorStore:
                     region=PINECONE_ENV
                 )
             )
-
-            # Wait until index is ready
             while not self.pc.describe_index(INDEX_NAME).status["ready"]:
                 time.sleep(1)
 
         self.index = self.pc.Index(INDEX_NAME)
 
     # -------------------------------------------------
-    # UPSERT (BATCHED + SAFE)
+    # UPSERT
     # -------------------------------------------------
 
     def upsert(
@@ -79,27 +71,76 @@ class VectorStore:
         for i in range(0, len(records), UPSERT_BATCH_SIZE):
             batch = records[i:i + UPSERT_BATCH_SIZE]
 
-            vectors = [
-                (r["id"], r["vector"], r["metadata"])
-                for r in batch
-                if r.get("id") and r.get("vector")
-            ]
+            vectors = []
+            for r in batch:
+                if (
+                    r.get("id")
+                    and isinstance(r.get("vector"), list)
+                    and len(r["vector"]) == EMBEDDING_DIM
+                ):
+                    vectors.append(
+                        (r["id"], r["vector"], r.get("metadata", {}))
+                    )
 
             if vectors:
-                self.index.upsert(
-                    vectors=vectors,
-                    namespace=namespace
-                )
+                self.index.upsert(vectors=vectors, namespace=namespace)
 
     # -------------------------------------------------
-    # DELETE
+    # QUERY (STRICT)
     # -------------------------------------------------
 
-    def delete_by_doc(
+    def query(
         self,
-        doc_id: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        filters: Optional[Dict] = None,
         namespace: str = DEFAULT_NAMESPACE
-    ) -> None:
+    ) -> List[Dict]:
+
+        if (
+            not query_vector
+            or not isinstance(query_vector, list)
+            or len(query_vector) != EMBEDDING_DIM
+        ):
+            return []
+
+        try:
+            response = self.index.query(
+                vector=query_vector,
+                top_k=top_k,
+                include_metadata=True,
+                filter=filters,
+                namespace=namespace
+            )
+        except Exception:
+            return []
+
+        matches = response.get("matches") or []
+        cleaned = []
+
+        for m in matches:
+            score = m.get("score", 0.0)
+            meta = m.get("metadata") or {}
+
+            if score < MIN_RAW_SCORE:
+                continue
+
+            if not REQUIRED_METADATA_FIELDS.issubset(meta.keys()):
+                continue  # 🔑 incomplete chunk → reject
+
+            cleaned.append({
+                "id": m.get("id"),
+                "score": score,
+                "metadata": meta
+            })
+
+        return cleaned
+
+    # -------------------------------------------------
+    # DELETE / RESET
+    # -------------------------------------------------
+
+    def delete_by_doc(self, doc_id: str, namespace: str = DEFAULT_NAMESPACE) -> None:
         self.index.delete(
             filter={"doc_id": {"$eq": doc_id}},
             namespace=namespace
@@ -114,53 +155,6 @@ class VectorStore:
             filter={"embedding_version": {"$eq": embedding_version}},
             namespace=namespace
         )
-
-    # -------------------------------------------------
-    # QUERY (DEFENSIVE)
-    # -------------------------------------------------
-
-    def query(
-        self,
-        query_vector: List[float],
-        top_k: int = 5,
-        filters: Optional[Dict] = None,
-        namespace: str = DEFAULT_NAMESPACE
-    ) -> List[Dict]:
-
-        if not query_vector:
-            return []
-
-        try:
-            response = self.index.query(
-                vector=query_vector,
-                top_k=top_k,
-                include_metadata=True,
-                filter=filters,
-                namespace=namespace
-            )
-        except Exception:
-            # Pinecone transient failure safety
-            return []
-
-        matches = response.get("matches") or []
-
-        cleaned = []
-        for m in matches:
-            score = m.get("score", 0.0)
-            if score < MIN_RAW_SCORE:
-                continue  # 🔑 garbage guard
-
-            cleaned.append({
-                "id": m.get("id"),
-                "score": score,
-                "metadata": m.get("metadata", {})
-            })
-
-        return cleaned
-
-    # -------------------------------------------------
-    # RESET (DANGEROUS – DEV ONLY)
-    # -------------------------------------------------
 
     def reset(self, namespace: str = DEFAULT_NAMESPACE) -> None:
         self.index.delete(delete_all=True, namespace=namespace)

@@ -3,7 +3,7 @@ import sys
 import shutil
 import hashlib
 import re
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +17,7 @@ if PROJECT_ROOT not in sys.path:
 
 # ---------------- INTERNAL IMPORTS ----------------
 
-from rag.retriever import Retriever
-from llm.answerer import generate_answer
+from rag.pipeline import RAGPipeline
 from llm.llm_client import LLMClient
 from ingestion.pipeline import ingest_pdf
 from embeddings.embedder import Embedder
@@ -28,8 +27,8 @@ from embeddings.vector_store import VectorStore
 
 app = FastAPI(
     title="Agri-RAG API",
-    description="Agriculture-only RAG with safe Gemini fallback",
-    version="1.0.0",
+    description="Evidence-bound agricultural QA system",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -55,9 +54,12 @@ os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 def startup_event():
     app.state.embedder = Embedder()
     app.state.vector_store = VectorStore()
-    app.state.retriever = Retriever(app.state.vector_store)
+    app.state.rag = RAGPipeline()
+
+    # Definition-only fallback (explicitly bounded)
     app.state.gemini_llm = LLMClient(provider="gemini")
-    print("✅ Agri-RAG startup complete")
+
+    print("✅ Agri-RAG API ready")
 
 # ---------------- DOMAIN GUARDS ----------------
 
@@ -69,54 +71,43 @@ AGRI_KEYWORDS = {
 }
 
 PERSON_PATTERNS = [
-    r"\bwho is\b",
-    r"\bbiography\b",
-    r"\bborn\b",
-    r"\bage\b",
-    r"\bnet worth\b",
+    r"\bwho is\b", r"\bbiography\b", r"\bborn\b",
+    r"\bage\b", r"\bnet worth\b"
 ]
-
 
 def is_agriculture_query(q: str) -> bool:
     q = q.lower()
     return any(k in q for k in AGRI_KEYWORDS)
 
-
 def looks_like_person_query(q: str) -> bool:
     q = q.lower()
     return any(re.search(p, q) for p in PERSON_PATTERNS)
 
-# ---------------- MULTI QUESTION SPLIT ----------------
+# ---------------- DEFINITION FAST-PATH ----------------
 
-def split_questions(text: str) -> List[str]:
-    parts = re.split(r"\band\b|\balso\b|;", text, flags=re.I)
-    return [p.strip() for p in parts if len(p.split()) > 2]
+DEFINITION_TRIGGERS = (
+    "what is", "define", "definition of", "meaning of", "explain"
+)
 
-# ---------------- SAFE GEMINI FALLBACK ----------------
+def is_definition_query(q: str) -> bool:
+    return q.lower().strip().startswith(DEFINITION_TRIGGERS)
 
 def safe_gemini_answer(question: str) -> str:
-    try:
-        answer = app.state.gemini_llm.generate(
-            system_prompt=(
-                "You are an agricultural expert.\n"
-                "Answer ONLY the question asked.\n"
-                "Be specific and practical.\n"
-                "Do NOT mention AI, documents, or sources."
-            ),
-            user_prompt=question,
-            temperature=0.3,
-            max_tokens=220,
-        )
-
-        if answer and len(answer.split()) >= 8:
-            return answer.strip()
-
-    except Exception as e:
-        print("⚠️ Gemini error:", e)
-
-    # LAST RESORT (only if Gemini is down)
-    return "Unable to generate a response at the moment. Please try again."
-
+    """
+    Used ONLY for pure definitions.
+    """
+    answer = app.state.gemini_llm.generate(
+        system_prompt=(
+            "You are an agricultural expert.\n"
+            "Give a clear, textbook-style definition.\n"
+            "Do not give advice or recommendations.\n"
+            "Do not mention documents, sources, or AI."
+        ),
+        user_prompt=question,
+        temperature=0.3,
+        max_tokens=220,
+    )
+    return answer.strip() if answer else ""
 
 # ---------------- UTILS ----------------
 
@@ -127,14 +118,12 @@ def _file_hash(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-
 def _load_state() -> Dict[str, str]:
     if not os.path.exists(STATE_FILE):
         return {}
     import json
     with open(STATE_FILE, "r") as f:
         return json.load(f)
-
 
 def _save_state(state: Dict[str, str]) -> None:
     import json
@@ -147,15 +136,14 @@ class ChatRequest(BaseModel):
     question: str
     intent: Optional[str] = None
     language: Optional[str] = None
-    top_k: int = 6
-
+    category: Optional[str] = None  # policy | market | advisory | disease | definition
 
 class ChatResponse(BaseModel):
-    answer: str
+    status: str
+    answer: Optional[str]
     confidence: float
-    citations: List[Dict]
-    refused: bool
-    refusal_reason: Optional[str] = None
+    message: Optional[str] = None
+    suggestion: Optional[str] = None
     diagnostics: Optional[Dict] = None
 
 # ---------------- ROUTES ----------------
@@ -173,61 +161,58 @@ def chat(req: ChatRequest):
     if not raw:
         raise HTTPException(400, "Empty question")
 
+    # ---------- HARD DOMAIN BLOCKS ----------
     if looks_like_person_query(raw):
         return ChatResponse(
-            answer="This system answers agriculture-related questions only.",
+            status="no_answer",
+            answer=None,
             confidence=0.0,
-            citations=[],
-            refused=True,
-            refusal_reason="person_query"
+            message="This system answers agriculture-related questions only.",
+            suggestion="Ask about crops, farming practices, or government schemes."
         )
 
     if not is_agriculture_query(raw):
         return ChatResponse(
-            answer="This system answers agriculture-related questions only.",
+            status="no_answer",
+            answer=None,
             confidence=0.0,
-            citations=[],
-            refused=True,
-            refusal_reason="non_agriculture"
+            message="This system is limited to agriculture-related topics.",
+            suggestion="Rephrase your question with an agriculture focus."
         )
 
-    questions = split_questions(raw)
-
-    answers = []
-    confidence = 0.0
-
-    for q in questions:
-        vectors = app.state.embedder.embed_texts([q])
-        retrieval = app.state.retriever.retrieve(
-            query=q,
-            query_vectors=vectors,
-            intent=req.intent,
-            language=req.language,
-            top_k=req.top_k,
+    # ---------- DEFINITION ONLY ----------
+    if is_definition_query(raw):
+        return ChatResponse(
+            status="answer",
+            answer=safe_gemini_answer(raw),
+            confidence=0.7,
+            diagnostics={"category": "definition"}
         )
 
-        chunks = retrieval["chunks"]
+    # ---------- RAG PIPELINE ----------
+    result = app.state.rag.run(
+        query=raw,
+        intent=req.intent,
+        language=req.language,
+        category=req.category
+    )
 
-        if not chunks:
-            answers.append(safe_gemini_answer(q))
-            confidence = max(confidence, 0.3)
-            continue
+    if result["status"] == "answer":
+        return ChatResponse(
+            status="answer",
+            answer=result["answer"],
+            confidence=result["confidence"],
+            diagnostics=result.get("diagnostics")
+        )
 
-        rag = generate_answer(q, chunks, retrieval["diagnostics"])
-
-        if not rag["answer"]:
-            answers.append(safe_gemini_answer(q))
-            confidence = max(confidence, 0.3)
-            continue
-
-        answers.append(rag["answer"])
-        confidence = max(confidence, max(c["score"] for c in chunks))
-
+    # ---------- GUIDED NO-ANSWER ----------
     return ChatResponse(
-        answer="\n\n".join(answers),
-        confidence=min(1.0, confidence),
-        citations=[],  # intentionally hidden
-        refused=False,
+        status="no_answer",
+        answer=None,
+        confidence=result.get("confidence", 0.0),
+        message=result.get("message"),
+        suggestion=result.get("suggestion"),
+        diagnostics=result.get("diagnostics")
     )
 
 # ---------------- PDF UPLOAD ----------------

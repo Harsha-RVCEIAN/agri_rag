@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
+
 import os
 import logging
 import re
@@ -5,10 +9,12 @@ from typing import Optional
 
 import torch
 from transformers import pipeline
+from dotenv import load_dotenv
 
-# ✅ NEW Gemini SDK (REQUIRED)
+# ✅ NEW Gemini SDK
 from google import genai
 from google.genai import types
+
 
 
 class LLMClient:
@@ -25,10 +31,6 @@ class LLMClient:
         - General agricultural knowledge
         - Definitions (e.g., organic farming)
     """
-
-    # -------------------------------------------------
-    # INIT
-    # -------------------------------------------------
 
     def __init__(
         self,
@@ -55,12 +57,15 @@ class LLMClient:
             )
             self.tokenizer = self.pipe.tokenizer
 
-        # ---------------- GEMINI ----------------
+        # ---------------- GEMINI (NEW SDK) ----------------
         elif self.provider == "gemini":
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                raise RuntimeError("GEMINI_API_KEY not set")
+            api_key = os.environ["GEMINI_API_KEY"]
 
+
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY is missing")
+
+            # ✅ CORRECT new SDK usage
             self.gemini_client = genai.Client(api_key=api_key)
 
         else:
@@ -80,7 +85,7 @@ class LLMClient:
 
     def _dedupe_repetition(self, text: str) -> str:
         """
-        HARD FIX for FLAN-T5 looping garbage.
+        HARD FIX for FLAN-T5 repetition loops.
         """
         sentences = re.split(r"(?<=[.!?])\s+", text)
         seen = set()
@@ -116,7 +121,6 @@ class LLMClient:
         # ================= LOCAL (FLAN-T5) =================
         if self.provider == "local":
             try:
-                # 🔑 FLAN needs explicit instruction
                 prompt = (
                     "Summarize the following agricultural information clearly.\n"
                     "Do not repeat sentences.\n\n"
@@ -140,11 +144,11 @@ class LLMClient:
                 text = output[0]["generated_text"].strip()
                 return self._dedupe_repetition(text)
 
-            except Exception as e:
+            except Exception:
                 logging.exception("❌ Local LLM failed")
                 return ""
 
-        # ================= GEMINI =================
+        # ================= GEMINI (NEW SDK) =================
         if self.provider == "gemini":
             try:
                 response = self.gemini_client.models.generate_content(
@@ -158,14 +162,16 @@ class LLMClient:
 
                 text = response.text.strip()
 
-                # HARD SAFETY: Gemini must answer properly
+                # Safety: reject garbage responses
                 if len(text.split()) < 6:
                     return ""
 
                 return text
 
-            except Exception as e:
+            except Exception:
                 logging.exception("❌ Gemini failed")
                 return ""
 
         return ""
+
+

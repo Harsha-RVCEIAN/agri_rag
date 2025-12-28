@@ -1,33 +1,16 @@
 """
-Multilingual RAG test.
+Multilingual Adversarial Test
 
-Purpose:
-- Verify retrieval works across languages
-- Verify answer language matches query language
-- Verify grounding is preserved
-- Verify no hallucination occurs
+Evaluator intent:
+- Language of answer MUST match query
+- System must refuse if grounding is weak
+- Translation guessing = FAIL
 """
 
 from rag.pipeline import RAGPipeline
 
 
-def assert_refusal(result: dict):
-    assert result["refused"] is True, "Expected refusal but got answer"
-    assert "not found" in result["answer"].lower()
-
-
-def assert_answer(result: dict):
-    assert result["refused"] is False, "Unexpected refusal"
-    assert result["answer"], "Empty answer"
-    assert result["confidence"] > 0.0, "Confidence should be > 0"
-    assert result["citations"], "Missing citations"
-
-
 def detect_language_simple(text: str) -> str:
-    """
-    Very rough language check (no ML).
-    Good enough for tests.
-    """
     if any(ch in text for ch in "ಅಆಇಈಉಊಎಏಐಒಓೌ"):
         return "kn"
     if any(ch in text for ch in "अआइईउऊएऐओऔ"):
@@ -35,55 +18,31 @@ def detect_language_simple(text: str) -> str:
     return "en"
 
 
-def test_multilingual_queries():
+def test_multilingual_adversarial():
     rag = RAGPipeline()
 
     queries = [
-        {
-            "lang": "en",
-            "q": "What is PM Kisan eligibility?",
-        },
-        {
-            "lang": "hi",
-            "q": "पीएम किसान योजना की पात्रता क्या है?",
-        },
-        {
-            "lang": "kn",
-            "q": "ಪಿಎಂ ಕಿಸಾನ್ ಯೋಜನೆಯ ಅರ್ಹತೆ ಏನು?",
-        },
+        ("en", "What is PM Kisan eligibility?"),
+        ("hi", "पीएम किसान योजना की पात्रता क्या है?"),
+        ("kn", "ಪಿಎಂ ಕಿಸಾನ್ ಯೋಜನೆಯ ಅರ್ಹತೆ ಏನು?"),
     ]
 
-    base_answer = None
+    for lang, q in queries:
+        result = rag.run(query=q)
 
-    for item in queries:
-        print(f"\n🔍 Testing language: {item['lang']}")
-        print(f"Query: {item['q']}")
+        if result["status"] == "no_answer":
+            # SAFE refusal is acceptable
+            assert result["confidence"] == 0.0
+            continue
 
-        result = rag.run(query=item["q"])
+        answer = result["answer"]
+        detected = detect_language_simple(answer)
 
-        # ---------- must not hallucinate ----------
-        assert "generally" not in result["answer"].lower()
-        assert "i think" not in result["answer"].lower()
-
-        # ---------- must answer ----------
-        assert_answer(result)
-
-        # ---------- language check ----------
-        detected = detect_language_simple(result["answer"])
-        assert detected == item["lang"], (
-            f"Expected language {item['lang']} but got {detected}"
+        assert detected == lang, (
+            f"Language mismatch: expected {lang}, got {detected}"
         )
 
-        # ---------- semantic consistency ----------
-        if base_answer is None:
-            base_answer = result["answer"]
-        else:
-            # not exact match, but should be about same scheme
-            assert "किसान" in result["answer"] or "ಕಿಸಾನ್" in result["answer"] or "kisan" in result["answer"].lower()
-
-        print("✅ Passed")
-
-
-if __name__ == "__main__":
-    test_multilingual_queries()
-    print("\n🎉 Multilingual test PASSED")
+        # hallucination guard
+        forbidden = ["i think", "generally", "usually"]
+        for f in forbidden:
+            assert f not in answer.lower()

@@ -1,90 +1,91 @@
 from typing import List, Dict, Optional
+from collections import Counter, defaultdict
+import math
 
 # ---------------- CONFIG ----------------
 
 DEFAULT_TOP_K = 6
-OVERFETCH_K = 20
+OVERFETCH_K = 30
 
-MIN_ADJUSTED_SCORE = 0.25
-WEAK_RETRIEVAL_THRESHOLD = 0.35
-MAX_MERGED_CANDIDATES = 40  # noise guard
+MIN_ADJUSTED_SCORE = 0.30
+WEAK_RETRIEVAL_THRESHOLD = 0.40
+MIN_COVERAGE_CHUNKS = 2
+MAX_MERGED_CANDIDATES = 50
+
+MAX_CHUNKS_PER_PAGE = 2
+MAX_CHUNKS_PER_SOURCE = 3
 
 CONTENT_TYPE_WEIGHT = {
-    "table_row": 1.30,
+    "table_row": 1.35,
     "procedure": 1.15,
     "text": 1.0,
-    "ocr": 0.7,
+    "ocr": 0.6,
 }
+
+INTENT_REQUIREMENTS = {
+    "numeric": {"table_row": 1},
+    "eligibility": {"table_row": 1},
+    "procedure": {"procedure": 1},
+}
+
+# hard penalties
+SINGLE_SOURCE_PENALTY = 0.85
+SINGLE_PAGE_PENALTY = 0.90
 
 
 class Retriever:
     """
-    Retriever = truth filter.
+    Evidence-first retriever.
 
-    Responsibilities:
-    - Rank chunks
-    - Penalize low-confidence / OCR content
-    - Prefer tables for numeric queries
-    - Detect weak / irrelevant retrieval
-
-    NOT responsible for:
-    - Embedding
-    - Answer generation
-    - Persistence
+    Guarantees:
+    - No silent low-quality retrieval
+    - Explicit diagnostics for pipeline
+    - Conservative confidence under weak agreement
     """
 
-    def __init__(self, vector_store, embedder=None):
+    def __init__(self, vector_store):
         self.vector_store = vector_store
-        self.embedder = embedder  # kept for interface consistency
 
-    # ---------- SCORE NORMALIZATION ----------
+    # ---------- NORMALIZATION ----------
 
-    def _normalize_scores(self, matches: List[Dict]) -> List[Dict]:
-        if not matches:
-            return matches
-
+    def _normalize(self, matches: List[Dict]) -> None:
         scores = [m["score"] for m in matches]
-        max_s, min_s = max(scores), min(scores)
-
-        if max_s == min_s:
-            for m in matches:
-                m["norm_score"] = 1.0
-            return matches
+        hi, lo = max(scores), min(scores)
 
         for m in matches:
-            m["norm_score"] = (m["score"] - min_s) / (max_s - min_s)
-
-        return matches
+            m["norm_score"] = 1.0 if hi == lo else (m["score"] - lo) / (hi - lo)
 
     # ---------- SCORE ADJUSTMENT ----------
 
-    def _adjust_score(self, match: Dict, intent: Optional[str]) -> float:
-        base = match.get("norm_score", match["score"])
-        meta = match["metadata"]
+    def _adjust(self, m: Dict) -> float:
+        meta = m["metadata"]
+        score = m["norm_score"]
 
-        content_type = meta.get("content_type", "text")
-        confidence = meta.get("confidence", 1.0)
-        priority = meta.get("priority", 3)
+        score *= CONTENT_TYPE_WEIGHT.get(meta.get("content_type", "text"), 1.0)
 
-        # Base weighting by content type
-        score = base * CONTENT_TYPE_WEIGHT.get(content_type, 1.0)
-
-        # OCR / confidence penalties
-        if confidence < 0.6:
+        conf = meta.get("confidence", 1.0)
+        if conf < 0.6:
             score *= 0.75
-        if confidence < 0.4:
+        if conf < 0.4:
             score *= 0.5
 
-        # Intent-based bias
-        if intent == "eligibility" and content_type == "table_row":
-            score *= 1.2
-        elif intent == "procedure" and content_type == "procedure":
-            score *= 1.15
+        priority = meta.get("priority", 3)
+        score *= (1 + (priority - 3) * 0.05)
 
-        # Priority fine-tuning
-        score *= (1.0 + (priority - 3) * 0.05)
+        return round(score, 4)
 
-        return score
+    # ---------- INTENT CONSTRAINT ----------
+
+    def _enforce_intent(self, chunks: List[Dict], intent: Optional[str]) -> Optional[str]:
+        if not intent or intent not in INTENT_REQUIREMENTS:
+            return None
+
+        counts = Counter(c["content_type"] for c in chunks)
+        for ctype, required in INTENT_REQUIREMENTS[intent].items():
+            if counts.get(ctype, 0) < required:
+                return f"missing_required_{ctype}"
+
+        return None
 
     # ---------- MAIN RETRIEVAL ----------
 
@@ -97,100 +98,129 @@ class Retriever:
         top_k: int = DEFAULT_TOP_K,
     ) -> Dict:
 
-        # ---------- METADATA FILTERS ----------
         filters = {}
-
         if language:
             filters["language"] = {"$eq": language}
 
-        if intent == "eligibility":
-            filters["content_type"] = {"$in": ["table_row", "procedure"]}
-            top_k = min(top_k, 5)
-
-        elif intent == "procedure":
-            filters["content_type"] = {"$in": ["procedure", "text"]}
-            top_k = min(top_k, 7)
-
-        # ---------- DENSE RETRIEVAL ----------
-        dense_matches: List[Dict] = []
-
+        raw: List[Dict] = []
         for v in query_vectors:
-            matches = self.vector_store.query(
+            res = self.vector_store.query(
                 query_vector=v,
                 top_k=OVERFETCH_K,
                 filters=filters,
             )
-            if matches:
-                dense_matches.extend(matches)
+            if res:
+                raw.extend(res)
 
-        if not dense_matches:
+        if not raw:
             return {
                 "chunks": [],
-                "diagnostics": {"reason": "no_matches"},
+                "diagnostics": {"status": "fail", "reason": "no_matches"},
             }
 
-        # ---------- NORMALIZE SCORES ----------
-        dense_matches = self._normalize_scores(dense_matches)
+        self._normalize(raw)
 
-        # ---------- MERGE (BEST MATCH PER CHUNK) ----------
-        merged: Dict[str, Dict] = {}
-        for m in dense_matches:
+        # ---------- MERGE BEST PER CHUNK ----------
+        merged = {}
+        for m in raw:
             cid = m["metadata"]["chunk_id"]
             if cid not in merged or merged[cid]["norm_score"] < m["norm_score"]:
                 merged[cid] = m
 
-        # ---------- NOISE GUARD (FIXED) ----------
-        # Sort BEFORE slicing to avoid random loss of good chunks
-        merged_values = sorted(
+        candidates = sorted(
             merged.values(),
-            key=lambda m: m["norm_score"],
+            key=lambda x: x["norm_score"],
             reverse=True
         )[:MAX_MERGED_CANDIDATES]
 
-        # ---------- ADJUST & FILTER ----------
+        # ---------- DIVERSITY + SCORING ----------
+        page_count = defaultdict(int)
+        source_count = defaultdict(int)
         ranked = []
-        for m in merged_values:
-            adjusted = self._adjust_score(m, intent)
-            if adjusted < MIN_ADJUSTED_SCORE:
+
+        for m in candidates:
+            meta = m["metadata"]
+            page = meta.get("page")
+            source = meta.get("source")
+
+            if page is not None and page_count[page] >= MAX_CHUNKS_PER_PAGE:
+                continue
+            if source and source_count[source] >= MAX_CHUNKS_PER_SOURCE:
                 continue
 
-            meta = m["metadata"]
+            score = self._adjust(m)
+            if score < MIN_ADJUSTED_SCORE:
+                continue
+
+            page_count[page] += 1
+            source_count[source] += 1
+
             ranked.append({
                 "chunk_id": meta["chunk_id"],
-                "score": adjusted,
+                "score": score,
                 "content_type": meta.get("content_type"),
-                "source": meta.get("source"),
-                "page": meta.get("page"),
+                "source": source,
+                "page": page,
                 "confidence": meta.get("confidence"),
                 "text": meta.get("text", ""),
             })
 
-        if not ranked:
+        if len(ranked) < MIN_COVERAGE_CHUNKS:
             return {
                 "chunks": [],
-                "diagnostics": {"reason": "low_quality"},
+                "diagnostics": {"status": "fail", "reason": "insufficient_coverage"},
             }
 
         ranked.sort(key=lambda x: x["score"], reverse=True)
 
-        # ---------- WEAK / IRRELEVANT RETRIEVAL ----------
         if ranked[0]["score"] < WEAK_RETRIEVAL_THRESHOLD:
             return {
                 "chunks": [],
-                "diagnostics": {
-                    "reason": "irrelevant_query",
-                    "top_score": ranked[0]["score"],
-                    "intent": intent,
-                },
+                "diagnostics": {"status": "fail", "reason": "low_confidence"},
             }
 
-        # ---------- SUCCESS ----------
+        intent_issue = self._enforce_intent(ranked, intent)
+        if intent_issue:
+            return {
+                "chunks": [],
+                "diagnostics": {"status": "fail", "reason": intent_issue},
+            }
+
+        # ---------- RETRIEVAL CONFIDENCE ----------
+        top = ranked[:top_k]
+        scores = [c["score"] for c in top]
+
+        avg = sum(scores) / len(scores)
+        mx = max(scores)
+
+        agreement = min(1.0, len(scores) / 3)
+
+        source_diversity = len(set(c["source"] for c in top if c.get("source")))
+        page_diversity = len(set(c["page"] for c in top if c.get("page") is not None))
+
+        penalty = 1.0
+        if source_diversity <= 1:
+            penalty *= SINGLE_SOURCE_PENALTY
+        if page_diversity <= 1:
+            penalty *= SINGLE_PAGE_PENALTY
+
+        retrieval_confidence = round(
+            (
+                0.6 * mx +
+                0.3 * avg +
+                0.1 * agreement
+            ) * penalty,
+            3
+        )
+
         return {
-            "chunks": ranked[:top_k],
+            "chunks": top,
             "diagnostics": {
-                "reason": "ok",
-                "returned": len(ranked),
-                "used": top_k,
+                "status": "ok",
                 "intent": intent,
+                "retrieval_confidence": retrieval_confidence,
+                "content_mix": dict(Counter(c["content_type"] for c in top)),
+                "source_diversity": source_diversity,
+                "page_diversity": page_diversity,
             },
         }

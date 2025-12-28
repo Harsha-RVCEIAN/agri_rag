@@ -1,26 +1,22 @@
 from typing import List, Dict, Optional
 import re
-
 from llm.llm_client import LLMClient
 
 # ---------------- CONFIG ----------------
 
 MAX_CONTEXT_CHUNKS = 4
 MAX_CHARS_PER_CHUNK = 700
-MIN_KEYWORD_OVERLAP = 1  # 🔑 semantic relevance gate
+MIN_KEYWORD_OVERLAP_RATIO = 0.3   # 🔥 proportional relevance
+FALLBACK_CONFIDENCE_THRESHOLD = 0.5
 
 SYSTEM_PROMPT = (
     "You are an agricultural expert assistant.\n\n"
-    "Answer STRICTLY using the provided context.\n"
-    "Summarize concisely.\n"
-    "DO NOT repeat the same idea.\n"
-    "DO NOT add external knowledge.\n"
-    "DO NOT guess.\n\n"
-    "If the context does not contain the answer, respond with:\n"
+    "Answer ONLY using the provided context.\n"
+    "Do NOT add knowledge.\n"
+    "Do NOT infer beyond the text.\n"
+    "If the answer is not fully supported, say:\n"
     "\"Not found in the provided documents.\""
 )
-
-# ---------------- LLM (LAZY SINGLETON) ----------------
 
 _llm: Optional[LLMClient] = None
 
@@ -35,109 +31,53 @@ def _get_llm() -> LLMClient:
 # ---------------- TEXT HELPERS ----------------
 
 def _clean_text(text: str) -> str:
-    text = " ".join(text.split())
-    text = text.replace("Key Features", "Key Features:\n")
-    text = text.replace(" - ", "\n- ")
-    return text.strip()
+    return " ".join(text.split()).strip()
 
 
-def _split_sentences(text: str) -> List[str]:
-    return re.split(r"(?<=[.!?])\s+", text)
-
-
-def _dedupe_sentences(text: str) -> str:
-    """
-    Removes repeated sentences across chunks.
-    Fixes repetition bug.
-    """
-    seen = set()
-    output = []
-
-    for s in _split_sentences(text):
-        s_clean = s.strip().lower()
-        if len(s_clean) < 10:
-            continue
-        if s_clean in seen:
-            continue
-        seen.add(s_clean)
-        output.append(s.strip())
-
-    return " ".join(output)
-
-
-# ---------------- SEMANTIC RELEVANCE (CRITICAL) ----------------
-
-def _extract_query_keywords(query: str) -> set:
-    """
-    Extract meaningful keywords from query.
-    This prevents 'organic farming' → rice fertilizer leakage.
-    """
+def _extract_keywords(text: str) -> set:
     stopwords = {
         "what", "is", "are", "the", "about", "explain",
         "tell", "me", "give", "define", "how"
     }
-    words = re.findall(r"[a-zA-Z]{4,}", query.lower())
-    return {w for w in words if w not in stopwords}
+    return {
+        w for w in re.findall(r"[a-zA-Z]{4,}", text.lower())
+        if w not in stopwords
+    }
 
 
-def _is_relevant(query: str, text: str) -> bool:
-    """
-    HARD relevance gate.
-    If this fails → fallback.
-    """
-    q_words = _extract_query_keywords(query)
+def _keyword_overlap_ratio(query: str, text: str) -> float:
+    q_words = _extract_keywords(query)
     if not q_words:
-        return False
-
+        return 0.0
     t = text.lower()
-    overlap = sum(1 for w in q_words if w in t)
-    return overlap >= MIN_KEYWORD_OVERLAP
+    matched = sum(1 for w in q_words if w in t)
+    return matched / len(q_words)
 
-
-# ---------------- LIST QUESTION HANDLING ----------------
-
-def _is_list_question(query: str) -> bool:
-    q = query.lower()
-    return any(
-        kw in q for kw in (
-            "feature", "features",
-            "benefit", "benefits",
-            "advantages",
-            "key points",
-            "components"
-        )
-    )
-
-
-def _extract_bullets(text: str) -> List[str]:
-    parts = re.split(r"\n-\s+|\n•\s+|- ", text)
-    bullets = []
-
-    for p in parts:
-        p = p.strip()
-        if len(p.split()) >= 3:
-            bullets.append(p)
-
-    return bullets
-
-
-# ---------------- CHUNK DEDUPE ----------------
 
 def _dedupe_chunks(docs: List[Dict]) -> List[Dict]:
     seen = set()
-    unique = []
-
+    out = []
     for d in docs:
         cid = d.get("chunk_id")
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-        unique.append(d)
-
-    return unique
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(d)
+    return out
 
 
-# ---------------- MAIN ANSWER FUNCTION ----------------
+def _audit_answer(answer: str, context: str) -> float:
+    """
+    Measures how much of the answer is supported by context.
+    """
+    a_words = _extract_keywords(answer)
+    if not a_words:
+        return 0.0
+    ctx = context.lower()
+    supported = sum(1 for w in a_words if w in ctx)
+    return supported / len(a_words)
+
+
+# ---------------- MAIN ----------------
 
 def generate_answer(
     query: str,
@@ -148,114 +88,91 @@ def generate_answer(
     Returns:
     {
         answer: str
+        confidence: float
         grounded: bool
         allow_fallback: bool
     }
     """
 
-    # ---------- NO DOCS ----------
+    # ---------- HARD FAIL ----------
     if not docs:
-        return {
-            "answer": "",
-            "grounded": False,
-            "allow_fallback": True
-        }
+        return _fallback("no_docs")
 
-    # ---------- RETRIEVER SAYS IRRELEVANT ----------
     if retrieval_diagnostics:
-        reason = retrieval_diagnostics.get("reason")
-        if reason in {"irrelevant_query", "weak_retrieval", "no_matches"}:
-            return {
-                "answer": "",
-                "grounded": False,
-                "allow_fallback": True
-            }
+        if retrieval_diagnostics.get("status") == "fail":
+            return _fallback(retrieval_diagnostics.get("reason"))
 
-    # ---------- DEDUPE ----------
     docs = _dedupe_chunks(docs)
     if not docs:
-        return {
-            "answer": "",
-            "grounded": False,
-            "allow_fallback": True
-        }
+        return _fallback("empty_after_dedupe")
 
-    # ==================================================
-    # LIST QUESTIONS (NO LLM GUESSING)
-    # ==================================================
-    if _is_list_question(query):
-        bullets: List[str] = []
-
-        for d in docs:
-            text = d.get("text") or ""
-            cleaned = _clean_text(text)
-            if _is_relevant(query, cleaned):
-                bullets.extend(_extract_bullets(cleaned))
-
-        bullets = list(dict.fromkeys(bullets))  # dedupe, preserve order
-
-        if bullets:
-            return {
-                "answer": "The key points are:\n" + "\n".join(f"- {b}" for b in bullets),
-                "grounded": True,
-                "allow_fallback": False
-            }
-
-        return {
-            "answer": "",
-            "grounded": False,
-            "allow_fallback": True
-        }
-
-    # ==================================================
-    # EXPLANATORY QUESTIONS (STRICT RAG)
-    # ==================================================
-    relevant_texts: List[str] = []
+    # ---------- CONTEXT SELECTION ----------
+    relevant_chunks = []
+    relevance_scores = []
 
     for d in docs:
-        text = d.get("text") or ""
-        cleaned = _clean_text(text)[:MAX_CHARS_PER_CHUNK]
+        text = _clean_text(d.get("text", ""))[:MAX_CHARS_PER_CHUNK]
+        overlap = _keyword_overlap_ratio(query, text)
 
-        if _is_relevant(query, cleaned):
-            relevant_texts.append(cleaned)
+        if overlap >= MIN_KEYWORD_OVERLAP_RATIO:
+            relevant_chunks.append(text)
+            relevance_scores.append(overlap)
 
-        if len(relevant_texts) >= MAX_CONTEXT_CHUNKS:
+        if len(relevant_chunks) >= MAX_CONTEXT_CHUNKS:
             break
 
-    if not relevant_texts:
-        return {
-            "answer": "",
-            "grounded": False,
-            "allow_fallback": True
-        }
+    if not relevant_chunks:
+        return _fallback("no_relevant_context")
 
-    context = _dedupe_sentences("\n\n".join(relevant_texts))
+    context = "\n\n".join(relevant_chunks)
 
-    user_prompt = (
-        "Context:\n"
-        f"{context}\n\n"
-        "Question:\n"
-        f"{query}\n\n"
-        "Answer:"
-    )
+    # ---------- CONFIDENCE COMPONENTS ----------
+    retrieval_strength = min(1.0, sum(relevance_scores) / len(relevance_scores))
+    query_coverage = min(1.0, len(relevant_chunks) / MAX_CONTEXT_CHUNKS)
 
+    # ---------- LLM ----------
     llm = _get_llm()
     answer = llm.generate(
         system_prompt=SYSTEM_PROMPT,
-        user_prompt=user_prompt,
+        user_prompt=f"Context:\n{context}\n\nQuestion:\n{query}\n\nAnswer:",
         temperature=0.0,
-        max_tokens=250
+        max_tokens=220
     ).strip()
 
     if not answer or "not found in the provided documents" in answer.lower():
+        return _fallback("llm_refused")
+
+    answer_grounding = _audit_answer(answer, context)
+
+    # ---------- FINAL CONFIDENCE ----------
+    final_confidence = round(
+        0.45 * retrieval_strength +
+        0.35 * query_coverage +
+        0.20 * answer_grounding,
+        3
+    )
+
+    if final_confidence < FALLBACK_CONFIDENCE_THRESHOLD:
         return {
             "answer": "",
+            "confidence": final_confidence,
             "grounded": False,
             "allow_fallback": True
         }
 
     return {
         "answer": answer,
+        "confidence": final_confidence,
         "grounded": True,
         "allow_fallback": False
+    }
+
+
+def _fallback(reason: str) -> Dict:
+    return {
+        "answer": "",
+        "confidence": 0.0,
+        "grounded": False,
+        "allow_fallback": True,
+        "reason": reason
     }

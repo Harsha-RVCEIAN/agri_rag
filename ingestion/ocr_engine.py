@@ -1,14 +1,11 @@
-# ingestion/ocr_engine.py
-
 import pytesseract
 from pytesseract import Output
 import numpy as np
 from typing import Tuple, Dict, List
-
+import re
 
 # ---------------- CONFIG ----------------
 
-# Mapping between detected language/script and Tesseract models
 LANG_MODEL_MAP = {
     "eng": "eng",
     "hin": "hin",
@@ -16,11 +13,35 @@ LANG_MODEL_MAP = {
     "tel": "tel",
     "tam": "tam",
     "mal": "mal",
-    "mixed": "eng+hin"  # safe fallback
+    "mixed": "eng+hin",
 }
 
-# Words below this confidence are considered unreliable
 MIN_WORD_CONFIDENCE = 40
+MIN_MEANINGFUL_WORDS = 5
+
+MAX_OCR_CONFIDENCE = 0.75          # OCR is never authoritative
+NOISE_PENALTY_RATIO = 0.35
+NUMERIC_HEAVY_PENALTY = 0.7        # 🔑 numeric OCR is riskier
+
+
+# ---------------- HELPERS ----------------
+
+def _noise_ratio(text: str) -> float:
+    if not text:
+        return 1.0
+    noise = len(re.findall(r"[^a-zA-Z0-9\s]", text))
+    return noise / max(len(text), 1)
+
+
+def _meaningful_word_count(words: List[str]) -> int:
+    return len([w for w in words if len(w) >= 3 and w.isalpha()])
+
+
+def _numeric_ratio(words: List[str]) -> float:
+    if not words:
+        return 1.0
+    numeric = sum(any(c.isdigit() for c in w) for w in words)
+    return numeric / len(words)
 
 
 # ---------------- CORE OCR ----------------
@@ -30,12 +51,12 @@ def run_ocr(
     language: str = "eng"
 ) -> Tuple[str, float, Dict]:
     """
-    Run OCR on a preprocessed image.
+    Conservative OCR extraction.
 
     Returns:
-        text (str): extracted OCR text
-        confidence (float): page-level confidence [0–1]
-        details (dict): block/word-level OCR metadata
+        text (str)
+        confidence (float)   # pessimistic, capped
+        details (dict)
     """
 
     lang_model = LANG_MODEL_MAP.get(language, "eng")
@@ -50,7 +71,7 @@ def run_ocr(
     words: List[str] = []
     confidences: List[int] = []
 
-    for i in range(len(ocr_data["text"])):
+    for i in range(len(ocr_data.get("text", []))):
         word = ocr_data["text"][i].strip()
         conf = ocr_data["conf"][i]
 
@@ -59,31 +80,53 @@ def run_ocr(
 
         try:
             conf = int(conf)
-        except ValueError:
+        except Exception:
             continue
 
-        if conf < 0:
+        if conf < MIN_WORD_CONFIDENCE:
             continue
 
         words.append(word)
         confidences.append(conf)
 
-    # -------- Text assembly --------
     text = " ".join(words)
 
-    # -------- Confidence aggregation --------
-    if confidences:
+    # ---------------- CONFIDENCE ----------------
+
+    meaningful_words = _meaningful_word_count(words)
+
+    if not confidences or meaningful_words < MIN_MEANINGFUL_WORDS:
+        page_confidence = 0.0
+    else:
         avg_conf = sum(confidences) / len(confidences)
         page_confidence = avg_conf / 100.0
-    else:
-        page_confidence = 0.0
 
-    # -------- Detailed metadata --------
+        # noise penalty
+        noise = _noise_ratio(text)
+        if noise > NOISE_PENALTY_RATIO:
+            page_confidence *= (1 - noise)
+
+        # numeric-heavy penalty (tables / dosages / prices)
+        numeric_ratio = _numeric_ratio(words)
+        if numeric_ratio > 0.4:
+            page_confidence *= NUMERIC_HEAVY_PENALTY
+
+        # hard cap
+        page_confidence = min(page_confidence, MAX_OCR_CONFIDENCE)
+
+    page_confidence = round(page_confidence, 3)
+
+    # ---------------- DETAILS ----------------
+
     details = {
         "word_count": len(words),
-        "avg_word_confidence": page_confidence,
+        "meaningful_words": meaningful_words,
+        "avg_word_confidence": round(
+            sum(confidences) / len(confidences) / 100.0, 3
+        ) if confidences else 0.0,
+        "noise_ratio": round(_noise_ratio(text), 3),
+        "numeric_ratio": round(_numeric_ratio(words), 3),
         "language_model": lang_model,
-        "raw_ocr_data": ocr_data
     }
 
     return text.strip(), page_confidence, details
