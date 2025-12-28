@@ -1,6 +1,5 @@
 from typing import List, Dict, Optional
 from collections import Counter, defaultdict
-import math
 
 # ---------------- CONFIG ----------------
 
@@ -28,7 +27,6 @@ INTENT_REQUIREMENTS = {
     "procedure": {"procedure": 1},
 }
 
-# hard penalties
 SINGLE_SOURCE_PENALTY = 0.85
 SINGLE_PAGE_PENALTY = 0.90
 
@@ -36,11 +34,10 @@ SINGLE_PAGE_PENALTY = 0.90
 class Retriever:
     """
     Evidence-first retriever.
-
-    Guarantees:
-    - No silent low-quality retrieval
-    - Explicit diagnostics for pipeline
-    - Conservative confidence under weak agreement
+    Optimized for:
+    - minimal overhead
+    - early rejection
+    - strict correctness
     """
 
     def __init__(self, vector_store):
@@ -50,10 +47,17 @@ class Retriever:
 
     def _normalize(self, matches: List[Dict]) -> None:
         scores = [m["score"] for m in matches]
-        hi, lo = max(scores), min(scores)
+        hi = max(scores)
+        lo = min(scores)
 
+        if hi == lo:
+            for m in matches:
+                m["norm_score"] = 1.0
+            return
+
+        denom = hi - lo
         for m in matches:
-            m["norm_score"] = 1.0 if hi == lo else (m["score"] - lo) / (hi - lo)
+            m["norm_score"] = (m["score"] - lo) / denom
 
     # ---------- SCORE ADJUSTMENT ----------
 
@@ -70,13 +74,16 @@ class Retriever:
             score *= 0.5
 
         priority = meta.get("priority", 3)
-        score *= (1 + (priority - 3) * 0.05)
+        if priority != 3:
+            score *= (1 + (priority - 3) * 0.05)
 
-        return round(score, 4)
+        return score
 
     # ---------- INTENT CONSTRAINT ----------
 
-    def _enforce_intent(self, chunks: List[Dict], intent: Optional[str]) -> Optional[str]:
+    def _enforce_intent(
+        self, chunks: List[Dict], intent: Optional[str]
+    ) -> Optional[str]:
         if not intent or intent not in INTENT_REQUIREMENTS:
             return None
 
@@ -87,7 +94,7 @@ class Retriever:
 
         return None
 
-    # ---------- MAIN RETRIEVAL ----------
+    # ---------- MAIN ----------
 
     def retrieve(
         self,
@@ -98,9 +105,7 @@ class Retriever:
         top_k: int = DEFAULT_TOP_K,
     ) -> Dict:
 
-        filters = {}
-        if language:
-            filters["language"] = {"$eq": language}
+        filters = {"language": {"$eq": language}} if language else None
 
         raw: List[Dict] = []
         for v in query_vectors:
@@ -118,13 +123,15 @@ class Retriever:
                 "diagnostics": {"status": "fail", "reason": "no_matches"},
             }
 
+        # ---------- NORMALIZE ----------
         self._normalize(raw)
 
         # ---------- MERGE BEST PER CHUNK ----------
-        merged = {}
+        merged: Dict[str, Dict] = {}
         for m in raw:
             cid = m["metadata"]["chunk_id"]
-            if cid not in merged or merged[cid]["norm_score"] < m["norm_score"]:
+            prev = merged.get(cid)
+            if not prev or m["norm_score"] > prev["norm_score"]:
                 merged[cid] = m
 
         candidates = sorted(
@@ -133,10 +140,13 @@ class Retriever:
             reverse=True
         )[:MAX_MERGED_CANDIDATES]
 
-        # ---------- DIVERSITY + SCORING ----------
+        # ---------- RANKING + DIVERSITY ----------
         page_count = defaultdict(int)
         source_count = defaultdict(int)
-        ranked = []
+        ranked: List[Dict] = []
+
+        adjust = self._adjust
+        min_score = MIN_ADJUSTED_SCORE
 
         for m in candidates:
             meta = m["metadata"]
@@ -148,22 +158,27 @@ class Retriever:
             if source and source_count[source] >= MAX_CHUNKS_PER_SOURCE:
                 continue
 
-            score = self._adjust(m)
-            if score < MIN_ADJUSTED_SCORE:
+            score = adjust(m)
+            if score < min_score:
                 continue
 
             page_count[page] += 1
-            source_count[source] += 1
+            if source:
+                source_count[source] += 1
 
             ranked.append({
                 "chunk_id": meta["chunk_id"],
-                "score": score,
+                "score": round(score, 4),
                 "content_type": meta.get("content_type"),
                 "source": source,
                 "page": page,
                 "confidence": meta.get("confidence"),
                 "text": meta.get("text", ""),
             })
+
+            # EARLY EXIT (safe)
+            if len(ranked) >= top_k * 2:
+                break
 
         if len(ranked) < MIN_COVERAGE_CHUNKS:
             return {
@@ -186,17 +201,16 @@ class Retriever:
                 "diagnostics": {"status": "fail", "reason": intent_issue},
             }
 
-        # ---------- RETRIEVAL CONFIDENCE ----------
+        # ---------- CONFIDENCE ----------
         top = ranked[:top_k]
         scores = [c["score"] for c in top]
 
+        mx = scores[0]
         avg = sum(scores) / len(scores)
-        mx = max(scores)
-
         agreement = min(1.0, len(scores) / 3)
 
-        source_diversity = len(set(c["source"] for c in top if c.get("source")))
-        page_diversity = len(set(c["page"] for c in top if c.get("page") is not None))
+        source_diversity = len({c["source"] for c in top if c["source"]})
+        page_diversity = len({c["page"] for c in top if c["page"] is not None})
 
         penalty = 1.0
         if source_diversity <= 1:
@@ -205,11 +219,7 @@ class Retriever:
             penalty *= SINGLE_PAGE_PENALTY
 
         retrieval_confidence = round(
-            (
-                0.6 * mx +
-                0.3 * avg +
-                0.1 * agreement
-            ) * penalty,
+            (0.6 * mx + 0.3 * avg + 0.1 * agreement) * penalty,
             3
         )
 

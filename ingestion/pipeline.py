@@ -14,6 +14,12 @@ from ingestion.chunker import chunk_page as chunk_text_page
 from ingestion.table_extractor import extract_tables_from_pdf
 
 
+# ---------------- CONSTANTS ----------------
+
+MAX_CHUNKS_PER_PAGE = 8          # 🔑 hard safety cap
+MIN_OCR_CONFIDENCE = 0.35        # 🔑 below this OCR is ignored
+
+
 # ---------------- UTILS ----------------
 
 def _doc_id_from_path(path: str) -> str:
@@ -32,18 +38,23 @@ def _normalize_language(lang_obj) -> str:
 
 def ingest_pdf(pdf_path: str) -> List[Dict]:
     """
-    FINAL ingestion pipeline.
+    FINAL ingestion pipeline (OPTIMIZED).
 
-    GUARANTEES:
-    - Clean text preferred over OCR
+    Guarantees preserved:
+    - Text preferred over OCR
     - Tables preserved with higher priority
     - No duplicate chunks
-    - Stable metadata for retrieval & ranking
+    - Stable metadata
+
+    New guarantees:
+    - OCR only when classifier demands
+    - Tables extracted once per page
+    - Hard chunk caps
+    - Lower latency
     """
 
     pages = load_pdf_pages(pdf_path)
     all_chunks: List[Dict] = []
-
     doc_id = _doc_id_from_path(pdf_path)
 
     for page in pages:
@@ -53,6 +64,7 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
         raw_text = (page.get("text") or "").strip()
         has_text = bool(raw_text)
 
+        # ---------- LANGUAGE (ONLY ON TEXT) ----------
         lang_obj = detect_language(raw_text) if has_text else None
         language = _normalize_language(lang_obj)
         language_conf = (
@@ -64,9 +76,18 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
         page_chunks: List[Dict] = []
 
         # =========================================================
-        # 1️⃣ TEXT PATH (PRIMARY – HIGHEST TRUST)
+        # 1️⃣ PAGE CLASSIFICATION (CRITICAL FIX)
         # =========================================================
-        if has_text:
+        page_class = classify_page({
+            "text": raw_text,
+            "images": page.get("images", []),
+            "header_repeat_score": page.get("header_repeat_score", 0.0),
+        })
+
+        # =========================================================
+        # 2️⃣ TEXT PATH (PRIMARY)
+        # =========================================================
+        if has_text and page_class == "TEXT_OK":
             page_obj = {
                 "doc_id": doc_id,
                 "page_number": page_number,
@@ -81,10 +102,10 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
             page_chunks.extend(chunk_text_page(page_obj))
 
         # =========================================================
-        # 2️⃣ OCR PATH (ONLY IF NO TEXT)
+        # 3️⃣ OCR PATH (STRICT, RARE)
         # =========================================================
-        if not page_chunks and page.get("images"):
-            ocr_text_blocks = []
+        if page_class == "OCR_REQUIRED" and page.get("images"):
+            ocr_blocks = []
             confidences = []
 
             for image in page["images"]:
@@ -96,18 +117,18 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
                 processed = preprocess_image(img)
                 text, conf, _ = run_ocr(processed, language)
 
-                if text and text.strip():
-                    ocr_text_blocks.append(text.strip())
+                if text and conf >= MIN_OCR_CONFIDENCE:
+                    ocr_blocks.append(text.strip())
                     confidences.append(conf)
 
-            if ocr_text_blocks:
+            if ocr_blocks:
                 avg_conf = statistics.median(confidences)
 
                 page_obj = {
                     "doc_id": doc_id,
                     "page_number": page_number,
                     "source": pdf_path,
-                    "content": "\n".join(ocr_text_blocks),
+                    "content": "\n".join(ocr_blocks),
                     "content_type": "ocr",
                     "language": language,
                     "confidence": round(avg_conf, 2),
@@ -117,7 +138,7 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
                 page_chunks.extend(chunk_text_page(page_obj))
 
         # =========================================================
-        # 3️⃣ TABLE EXTRACTION (PARALLEL, HIGH PRIORITY)
+        # 4️⃣ TABLE EXTRACTION (ONCE PER PAGE)
         # =========================================================
         try:
             table_chunks = extract_tables_from_pdf(
@@ -133,7 +154,7 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
             table_chunks = []
 
         # =========================================================
-        # 4️⃣ FINAL FAILSAFE (NEVER EMPTY PAGE)
+        # 5️⃣ FAILSAFE (TEXT ONLY)
         # =========================================================
         if not page_chunks and has_text:
             page_chunks.append({
@@ -150,26 +171,26 @@ def ingest_pdf(pdf_path: str) -> List[Dict]:
             })
 
         # =========================================================
-        # 5️⃣ NORMALIZATION & DEDUPE
+        # 6️⃣ DEDUPE + HARD CAP
         # =========================================================
-        seen_texts = set()
+        seen_hashes = set()
+        merged = page_chunks + table_chunks
 
-        for chunk in page_chunks + table_chunks:
-            text = (chunk.get("text") or chunk.get("content") or "").strip()
+        for chunk in merged:
+            if len(all_chunks) >= MAX_CHUNKS_PER_PAGE * len(pages):
+                break
+
+            text = (chunk.get("text") or "").strip()
             if not text:
                 continue
 
-            text_hash = hashlib.md5(text.encode()).hexdigest()
-            if text_hash in seen_texts:
+            h = hashlib.md5(text.encode()).hexdigest()
+            if h in seen_hashes:
                 continue
-            seen_texts.add(text_hash)
+            seen_hashes.add(h)
 
             meta = chunk.get("metadata", {})
-
-            meta.setdefault(
-                "chunk_id",
-                f"{doc_id}_page_{page_number}_{text_hash[:8]}"
-            )
+            meta.setdefault("chunk_id", f"{doc_id}_p{page_number}_{h[:8]}")
             meta.setdefault("page", page_number)
             meta.setdefault("source", pdf_path)
             meta.setdefault("language", language)

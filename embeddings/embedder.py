@@ -1,14 +1,35 @@
 from typing import List, Dict
 import torch
 from sentence_transformers import SentenceTransformer
+from functools import lru_cache
 
 
 # ---------------- CONFIG ----------------
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_VERSION = "minilm_v1"
-BATCH_SIZE = 32
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Dynamic batch sizing
+BATCH_SIZE = 64 if DEVICE == "cuda" else 16
+
+
+# ---------------- GLOBAL SINGLETON ----------------
+# 🔑 Prevent repeated model loads
+
+_MODEL = None
+
+
+def _get_model() -> SentenceTransformer:
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer(
+            EMBEDDING_MODEL_NAME,
+            device=DEVICE
+        )
+        _MODEL.eval()
+    return _MODEL
 
 
 # ---------------- EMBEDDER ----------------
@@ -16,20 +37,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 class Embedder:
     """
     Responsible ONLY for:
-    - loading embedding model
-    - embedding text (chunks or queries)
+    - embedding text (queries or chunks)
     - normalizing vectors
     """
 
     def __init__(self):
-        self.model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME,
-            device=DEVICE
-        )
-        self.model.eval()
+        self.model = _get_model()
 
     # -------------------------------------------------
-    # INTERNAL CORE EMBEDDING
+    # CORE EMBEDDING
     # -------------------------------------------------
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
@@ -38,35 +54,51 @@ class Embedder:
 
         vectors: List[List[float]] = []
 
-        for start in range(0, len(texts), BATCH_SIZE):
-            batch = texts[start:start + BATCH_SIZE]
+        with torch.no_grad():
+            for start in range(0, len(texts), BATCH_SIZE):
+                batch = texts[start:start + BATCH_SIZE]
 
-            with torch.no_grad():
                 embs = self.model.encode(
                     batch,
                     convert_to_numpy=True,
                     normalize_embeddings=True,
-                    show_progress_bar=False
+                    show_progress_bar=False,
                 )
 
-            vectors.extend(embs.tolist())
+                vectors.extend(embs.tolist())
 
         return vectors
 
     # -------------------------------------------------
-    # QUERY EMBEDDING (NEW — REQUIRED)
+    # QUERY EMBEDDING (CACHED)
     # -------------------------------------------------
+
+    @lru_cache(maxsize=1024)
+    def _embed_single_query(self, text: str) -> List[float]:
+        """
+        Cache single-query embeddings.
+        Massive latency win for repeated questions.
+        """
+        vec = self._embed([text])
+        return vec[0] if vec else []
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
         """
-        Embed raw query texts.
-        Returns list of vectors.
+        Embed query texts.
+        Uses cache for single queries.
         """
-        clean_texts = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
-        return self._embed(clean_texts)
+        clean = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
+        if not clean:
+            return []
+
+        # Fast path: single query
+        if len(clean) == 1:
+            return [self._embed_single_query(clean[0])]
+
+        return self._embed(clean)
 
     # -------------------------------------------------
-    # CHUNK EMBEDDING (EXISTING)
+    # CHUNK EMBEDDING (UNCHANGED SEMANTICS)
     # -------------------------------------------------
 
     def embed_chunks(self, chunks: List[Dict]) -> List[Dict]:
@@ -98,9 +130,9 @@ class Embedder:
                 "vector": vector,
                 "metadata": {
                     **meta,
-                    "text": chunk["text"],  # required for RAG
+                    "text": chunk["text"],
                     "embedding_version": EMBEDDING_VERSION,
-                    "embedding_model": EMBEDDING_MODEL_NAME
+                    "embedding_model": EMBEDDING_MODEL_NAME,
                 }
             })
 

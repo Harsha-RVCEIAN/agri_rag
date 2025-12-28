@@ -1,35 +1,40 @@
-from dotenv import load_dotenv
-load_dotenv(override=True)
-
-
 import os
 import logging
 import re
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 import torch
 from transformers import pipeline
-from dotenv import load_dotenv
 
-# ✅ NEW Gemini SDK
+# Gemini SDK
 from google import genai
 from google.genai import types
 
 
+# ---------------- GLOBAL SINGLETONS ----------------
+# 🔑 Prevents repeated heavy initialization
+
+_LOCAL_PIPE = None
+_LOCAL_TOKENIZER = None
+_GEMINI_CLIENT = None
+
 
 class LLMClient:
     """
-    Unified LLM client (STRICT ROLE SEPARATION).
+    Unified LLM client with strict role separation.
 
     LOCAL (FLAN-T5):
-        - Summarization
-        - Grounded extraction
         - RAG answers ONLY
+        - Grounded extraction
+        - Deterministic output
 
     GEMINI:
-        - Fallback
-        - General agricultural knowledge
-        - Definitions (e.g., organic farming)
+        - Definitions
+        - Safe fallback
+        - General agriculture knowledge
     """
 
     def __init__(
@@ -43,30 +48,31 @@ class LLMClient:
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
 
-        self.pipe = None
-        self.tokenizer = None
-        self.gemini_client = None
+        global _LOCAL_PIPE, _LOCAL_TOKENIZER, _GEMINI_CLIENT
 
         # ---------------- LOCAL MODEL ----------------
         if self.provider == "local":
-            device = 0 if torch.cuda.is_available() else -1
-            self.pipe = pipeline(
-                task="text2text-generation",
-                model=local_model,
-                device=device,
-            )
-            self.tokenizer = self.pipe.tokenizer
+            if _LOCAL_PIPE is None:
+                device = 0 if torch.cuda.is_available() else -1
+                _LOCAL_PIPE = pipeline(
+                    task="text2text-generation",
+                    model=local_model,
+                    device=device,
+                )
+                _LOCAL_TOKENIZER = _LOCAL_PIPE.tokenizer
 
-        # ---------------- GEMINI (NEW SDK) ----------------
+            self.pipe = _LOCAL_PIPE
+            self.tokenizer = _LOCAL_TOKENIZER
+
+        # ---------------- GEMINI ----------------
         elif self.provider == "gemini":
-            api_key = os.environ["GEMINI_API_KEY"]
+            if _GEMINI_CLIENT is None:
+                api_key = os.getenv("GEMINI_API_KEY")
+                if not api_key:
+                    raise RuntimeError("GEMINI_API_KEY is missing")
+                _GEMINI_CLIENT = genai.Client(api_key=api_key)
 
-
-            if not api_key:
-                raise RuntimeError("GEMINI_API_KEY is missing")
-
-            # ✅ CORRECT new SDK usage
-            self.gemini_client = genai.Client(api_key=api_key)
+            self.gemini_client = _GEMINI_CLIENT
 
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
@@ -76,6 +82,8 @@ class LLMClient:
     # -------------------------------------------------
 
     def _truncate(self, text: str) -> str:
+        if not self.tokenizer:
+            return text
         tokens = self.tokenizer.encode(
             text,
             truncation=True,
@@ -85,7 +93,7 @@ class LLMClient:
 
     def _dedupe_repetition(self, text: str) -> str:
         """
-        HARD FIX for FLAN-T5 repetition loops.
+        Hard stop for FLAN-T5 repetition loops.
         """
         sentences = re.split(r"(?<=[.!?])\s+", text)
         seen = set()
@@ -122,7 +130,7 @@ class LLMClient:
         if self.provider == "local":
             try:
                 prompt = (
-                    "Summarize the following agricultural information clearly.\n"
+                    "Answer strictly using the provided context.\n"
                     "Do not repeat sentences.\n\n"
                     f"{system_prompt}\n\n"
                     f"{user_prompt}"
@@ -137,8 +145,8 @@ class LLMClient:
                         self.max_output_tokens,
                     ),
                     do_sample=False,
-                    repetition_penalty=1.25,
                     num_beams=4,
+                    repetition_penalty=1.25,
                 )
 
                 text = output[0]["generated_text"].strip()
@@ -148,7 +156,7 @@ class LLMClient:
                 logging.exception("❌ Local LLM failed")
                 return ""
 
-        # ================= GEMINI (NEW SDK) =================
+        # ================= GEMINI =================
         if self.provider == "gemini":
             try:
                 response = self.gemini_client.models.generate_content(
@@ -158,11 +166,12 @@ class LLMClient:
                         temperature=temperature,
                         max_output_tokens=max_tokens or self.max_output_tokens,
                     ),
+                    timeout=10,  # 🔑 HARD TIMEOUT (major latency win)
                 )
 
-                text = response.text.strip()
+                text = (response.text or "").strip()
 
-                # Safety: reject garbage responses
+                # Safety: reject garbage / empty answers
                 if len(text.split()) < 6:
                     return ""
 
@@ -173,5 +182,3 @@ class LLMClient:
                 return ""
 
         return ""
-
-

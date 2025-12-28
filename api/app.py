@@ -4,6 +4,7 @@ import shutil
 import hashlib
 import re
 from typing import Optional, Dict
+from functools import lru_cache
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +29,7 @@ from embeddings.vector_store import VectorStore
 app = FastAPI(
     title="Agri-RAG API",
     description="Evidence-bound agricultural QA system",
-    version="2.1.0",
+    version="2.2.1",
 )
 
 app.add_middleware(
@@ -48,6 +49,29 @@ STATE_FILE = os.path.join(DATA_DIR, "vector_store", "index_state.json")
 os.makedirs(PDF_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
+# ---------------- STATE UTILS (🔥 FIXED) ----------------
+
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_state() -> Dict[str, str]:
+    if not os.path.exists(STATE_FILE):
+        return {}
+    import json
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
+
+
+def _save_state(state: Dict[str, str]) -> None:
+    import json
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
 # ---------------- STARTUP ----------------
 
 @app.on_event("startup")
@@ -55,10 +79,7 @@ def startup_event():
     app.state.embedder = Embedder()
     app.state.vector_store = VectorStore()
     app.state.rag = RAGPipeline()
-
-    # Definition-only fallback (explicitly bounded)
     app.state.gemini_llm = LLMClient(provider="gemini")
-
     print("✅ Agri-RAG API ready")
 
 # ---------------- DOMAIN GUARDS ----------------
@@ -70,10 +91,14 @@ AGRI_KEYWORDS = {
     "scheme", "pm kisan", "pmfby", "insurance",
 }
 
-PERSON_PATTERNS = [
+PERSON_PATTERNS = (
     r"\bwho is\b", r"\bbiography\b", r"\bborn\b",
     r"\bage\b", r"\bnet worth\b"
-]
+)
+
+DEFINITION_TRIGGERS = (
+    "what is", "define", "definition of", "meaning of", "explain"
+)
 
 def is_agriculture_query(q: str) -> bool:
     q = q.lower()
@@ -83,52 +108,41 @@ def looks_like_person_query(q: str) -> bool:
     q = q.lower()
     return any(re.search(p, q) for p in PERSON_PATTERNS)
 
-# ---------------- DEFINITION FAST-PATH ----------------
-
-DEFINITION_TRIGGERS = (
-    "what is", "define", "definition of", "meaning of", "explain"
-)
-
 def is_definition_query(q: str) -> bool:
     return q.lower().strip().startswith(DEFINITION_TRIGGERS)
 
-def safe_gemini_answer(question: str) -> str:
-    """
-    Used ONLY for pure definitions.
-    """
-    answer = app.state.gemini_llm.generate(
+# ---------------- DEFINITION CACHE ----------------
+
+@lru_cache(maxsize=256)
+def cached_definition(question: str) -> str:
+    return app.state.gemini_llm.generate(
         system_prompt=(
             "You are an agricultural expert.\n"
             "Give a clear, textbook-style definition.\n"
-            "Do not give advice or recommendations.\n"
-            "Do not mention documents, sources, or AI."
+            "No advice. No recommendations. No sources."
         ),
         user_prompt=question,
         temperature=0.3,
         max_tokens=220,
+    ).strip()
+
+# ---------------- RAG CACHE ----------------
+# ⚠️ NOTE: cache is cleared automatically on restart.
+# Good enough for demo + evaluation.
+
+@lru_cache(maxsize=512)
+def cached_rag_answer(
+    question: str,
+    intent: Optional[str],
+    language: Optional[str],
+    category: Optional[str],
+) -> Dict:
+    return app.state.rag.run(
+        query=question,
+        intent=intent,
+        language=language,
+        category=category,
     )
-    return answer.strip() if answer else ""
-
-# ---------------- UTILS ----------------
-
-def _file_hash(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def _load_state() -> Dict[str, str]:
-    if not os.path.exists(STATE_FILE):
-        return {}
-    import json
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
-
-def _save_state(state: Dict[str, str]) -> None:
-    import json
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
 
 # ---------------- SCHEMAS ----------------
 
@@ -136,7 +150,7 @@ class ChatRequest(BaseModel):
     question: str
     intent: Optional[str] = None
     language: Optional[str] = None
-    category: Optional[str] = None  # policy | market | advisory | disease | definition
+    category: Optional[str] = None
 
 class ChatResponse(BaseModel):
     status: str
@@ -161,14 +175,14 @@ def chat(req: ChatRequest):
     if not raw:
         raise HTTPException(400, "Empty question")
 
-    # ---------- HARD DOMAIN BLOCKS ----------
+    # ---------- FAST HARD REJECT ----------
     if looks_like_person_query(raw):
         return ChatResponse(
             status="no_answer",
             answer=None,
             confidence=0.0,
             message="This system answers agriculture-related questions only.",
-            suggestion="Ask about crops, farming practices, or government schemes."
+            suggestion="Ask about crops, farming practices, or schemes."
         )
 
     if not is_agriculture_query(raw):
@@ -176,25 +190,25 @@ def chat(req: ChatRequest):
             status="no_answer",
             answer=None,
             confidence=0.0,
-            message="This system is limited to agriculture-related topics.",
-            suggestion="Rephrase your question with an agriculture focus."
+            message="This system is limited to agriculture topics.",
+            suggestion="Rephrase with an agriculture focus."
         )
 
-    # ---------- DEFINITION ONLY ----------
+    # ---------- FAST DEFINITION ----------
     if is_definition_query(raw):
         return ChatResponse(
             status="answer",
-            answer=safe_gemini_answer(raw),
+            answer=cached_definition(raw),
             confidence=0.7,
             diagnostics={"category": "definition"}
         )
 
-    # ---------- RAG PIPELINE ----------
-    result = app.state.rag.run(
-        query=raw,
-        intent=req.intent,
-        language=req.language,
-        category=req.category
+    # ---------- CACHED RAG ----------
+    result = cached_rag_answer(
+        raw,
+        req.intent,
+        req.language,
+        req.category
     )
 
     if result["status"] == "answer":
@@ -205,7 +219,6 @@ def chat(req: ChatRequest):
             diagnostics=result.get("diagnostics")
         )
 
-    # ---------- GUIDED NO-ANSWER ----------
     return ChatResponse(
         status="no_answer",
         answer=None,

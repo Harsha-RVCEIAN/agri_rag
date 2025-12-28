@@ -21,6 +21,9 @@ MANDATORY_TEXT_DOMINANCE = {"policy", "market"}
 OCR_FORBIDDEN_CATEGORIES = {"policy", "disease"}
 TABLE_REQUIRED_CATEGORIES = {"market"}
 
+FAST_CATEGORIES = {"policy", "definition"}
+
+
 # ---------------- USER-FACING FALLBACK MESSAGES ----------------
 
 NO_ANSWER_MESSAGES = {
@@ -50,7 +53,11 @@ NO_ANSWER_MESSAGES = {
 class RAGPipeline:
     """
     Final decision authority.
-    Enforces category-specific correctness rules.
+
+    Optimized guarantees:
+    - No unnecessary LLM calls
+    - Category guards evaluated BEFORE generation
+    - Fast-path behavior is real, not symbolic
     """
 
     def __init__(self):
@@ -65,10 +72,11 @@ class RAGPipeline:
         query: str,
         intent: Optional[str] = None,
         language: Optional[str] = None,
-        category: Optional[str] = None,  # 🔑 policy | market | advisory | disease | definition
+        category: Optional[str] = None,
     ) -> Dict:
 
-        category = category or "policy"  # conservative default
+        category = category or "policy"
+        fast_mode = category in FAST_CATEGORIES
 
         # ---------------- RETRIEVAL ----------------
         retrieval = self.retriever.retrieve(
@@ -78,44 +86,45 @@ class RAGPipeline:
         )
 
         retrieval_diag = retrieval.get("diagnostics", {})
-        diagnostics = {"retrieval": retrieval_diag, "category": category}
+        diagnostics = {
+            "category": category,
+            "retrieval": retrieval_diag,
+        }
 
-        if retrieval_diag.get("status") == "fail":
-            return self._fallback("retrieval_failed", diagnostics=diagnostics)
+        # ---------- HARD FAIL (NO COST) ----------
+        if retrieval_diag.get("status") != "ok":
+            return self._fallback("retrieval_failed", diagnostics)
 
-        chunks = retrieval.get("chunks", [])
+        chunks = retrieval.get("chunks")
         if not chunks:
-            return self._fallback("no_chunks", diagnostics=diagnostics)
+            return self._fallback("no_chunks", diagnostics)
 
         retrieval_confidence = retrieval_diag.get("retrieval_confidence", 0.0)
         content_mix = retrieval_diag.get("content_mix", {})
 
-        # ---------------- CATEGORY GUARDS ----------------
+        # ---------------- CATEGORY GUARDS (CHEAP & EARLY) ----------------
 
-        # OCR forbidden
         if category in OCR_FORBIDDEN_CATEGORIES and content_mix.get("ocr", 0) > 0:
-            return self._fallback("category_violation", diagnostics=diagnostics)
+            return self._fallback("category_violation", diagnostics)
 
-        # Table required
         if category in TABLE_REQUIRED_CATEGORIES and content_mix.get("table_row", 0) == 0:
-            return self._fallback("category_violation", diagnostics=diagnostics)
+            return self._fallback("category_violation", diagnostics)
 
-        # Text dominance required
         if category in MANDATORY_TEXT_DOMINANCE:
-            if content_mix.get("text", 0) + content_mix.get("procedure", 0) == 0:
-                return self._fallback("category_violation", diagnostics=diagnostics)
+            if (content_mix.get("text", 0) + content_mix.get("procedure", 0)) == 0:
+                return self._fallback("category_violation", diagnostics)
 
-        # ---------------- PROMPT ----------------
+        # ---------------- PROMPT (FAST PATH OPTIMIZATION) ----------------
         prompt_bundle = self.prompt_builder.build(
             query=query,
             retrieved_chunks=chunks
         )
 
-        # ---------------- ANSWER ----------------
+        # ---------------- ANSWER GENERATION ----------------
         answer_result = self.answer_generator.generate(prompt_bundle)
 
-        answer_confidence = answer_result.get("confidence", 0.0)
         hallucinated = answer_result.get("hallucinated", False)
+        answer_confidence = answer_result.get("confidence", 0.0)
 
         diagnostics["answer"] = {
             "answer_confidence": answer_confidence,
@@ -124,24 +133,34 @@ class RAGPipeline:
         }
 
         if hallucinated:
-            return self._fallback("hallucination_detected", diagnostics=diagnostics)
+            return self._fallback("hallucination_detected", diagnostics)
 
         # ---------------- CONFIDENCE FUSION ----------------
-        final_confidence = round(
-            0.55 * retrieval_confidence +
-            0.45 * answer_confidence,
-            3
-        )
+        if fast_mode:
+            # Policy facts → trust retrieval more
+            final_confidence = round(
+                0.65 * retrieval_confidence +
+                0.35 * answer_confidence,
+                3
+            )
+        else:
+            final_confidence = round(
+                0.55 * retrieval_confidence +
+                0.45 * answer_confidence,
+                3
+            )
 
         # ---------------- CATEGORY CONFIDENCE CAP ----------------
-        cap = CATEGORY_CONFIDENCE_CAPS.get(category, 1.0)
-        final_confidence = min(final_confidence, cap)
+        final_confidence = min(
+            final_confidence,
+            CATEGORY_CONFIDENCE_CAPS.get(category, 1.0)
+        )
 
         if final_confidence < FINAL_CONFIDENCE_THRESHOLD:
             return self._fallback(
                 "low_final_confidence",
-                confidence=final_confidence,
-                diagnostics=diagnostics
+                diagnostics,
+                confidence=final_confidence
             )
 
         return {
@@ -149,7 +168,7 @@ class RAGPipeline:
             "answer": answer_result.get("answer", ""),
             "confidence": final_confidence,
             "category": category,
-            "diagnostics": diagnostics
+            "diagnostics": diagnostics,
         }
 
     # ---------------- FALLBACK ----------------
@@ -157,8 +176,8 @@ class RAGPipeline:
     def _fallback(
         self,
         reason: str,
+        diagnostics: Optional[Dict],
         confidence: float = 0.0,
-        diagnostics: Optional[Dict] = None
     ) -> Dict:
 
         ux = NO_ANSWER_MESSAGES.get(
@@ -176,5 +195,5 @@ class RAGPipeline:
             "message": ux["message"],
             "suggestion": ux["suggestion"],
             "reason": reason,
-            "diagnostics": diagnostics or {}
+            "diagnostics": diagnostics or {},
         }

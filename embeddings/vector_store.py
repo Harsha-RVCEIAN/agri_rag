@@ -1,11 +1,13 @@
 import os
 import time
 from typing import List, Dict, Optional
+from functools import lru_cache
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from pinecone import Pinecone, ServerlessSpec
+
 
 # ---------------- CONFIG ----------------
 
@@ -16,8 +18,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "agri-rag")
 EMBEDDING_DIM = 384
 METRIC = "cosine"
 
-# HARD SAFETY GUARDS
-MIN_RAW_SCORE = 0.22          # ↑ stricter, realistic for cosine
+MIN_RAW_SCORE = 0.22
 UPSERT_BATCH_SIZE = 100
 
 DEFAULT_NAMESPACE = "agriculture"
@@ -28,36 +29,66 @@ REQUIRED_METADATA_FIELDS = {
     "source",
 }
 
+
+# ---------------- GLOBAL SINGLETON ----------------
+# 🔑 Avoid repeated Pinecone init & index checks
+
+_PC = None
+_INDEX = None
+
+
+def _get_index():
+    global _PC, _INDEX
+
+    if _INDEX is not None:
+        return _INDEX
+
+    if not PINECONE_API_KEY:
+        raise RuntimeError("PINECONE_API_KEY not set")
+
+    if _PC is None:
+        _PC = Pinecone(api_key=PINECONE_API_KEY)
+
+    existing = {i["name"] for i in _PC.list_indexes()}
+
+    if INDEX_NAME not in existing:
+        _PC.create_index(
+            name=INDEX_NAME,
+            dimension=EMBEDDING_DIM,
+            metric=METRIC,
+            spec=ServerlessSpec(
+                cloud="aws",
+                region=PINECONE_ENV
+            )
+        )
+
+        # non-busy wait (polite)
+        while True:
+            status = _PC.describe_index(INDEX_NAME).status
+            if status.get("ready"):
+                break
+            time.sleep(0.5)
+
+    _INDEX = _PC.Index(INDEX_NAME)
+    return _INDEX
+
+
 # ---------------- VECTOR STORE ----------------
 
 class VectorStore:
     """
-    Pinecone-backed vector store (defensive).
+    Pinecone-backed vector store.
+    Optimized for:
+    - low startup latency
+    - minimal network roundtrips
+    - strict safety guarantees
     """
 
     def __init__(self):
-        if not PINECONE_API_KEY:
-            raise RuntimeError("PINECONE_API_KEY not set")
-
-        self.pc = Pinecone(api_key=PINECONE_API_KEY)
-
-        if INDEX_NAME not in self.pc.list_indexes().names():
-            self.pc.create_index(
-                name=INDEX_NAME,
-                dimension=EMBEDDING_DIM,
-                metric=METRIC,
-                spec=ServerlessSpec(
-                    cloud="aws",
-                    region=PINECONE_ENV
-                )
-            )
-            while not self.pc.describe_index(INDEX_NAME).status["ready"]:
-                time.sleep(1)
-
-        self.index = self.pc.Index(INDEX_NAME)
+        self.index = _get_index()
 
     # -------------------------------------------------
-    # UPSERT
+    # UPSERT (BATCHED, SAFE)
     # -------------------------------------------------
 
     def upsert(
@@ -65,28 +96,31 @@ class VectorStore:
         records: List[Dict],
         namespace: str = DEFAULT_NAMESPACE
     ) -> None:
+
         if not records:
             return
 
         for i in range(0, len(records), UPSERT_BATCH_SIZE):
             batch = records[i:i + UPSERT_BATCH_SIZE]
 
-            vectors = []
-            for r in batch:
+            vectors = [
+                (r["id"], r["vector"], r.get("metadata", {}))
+                for r in batch
                 if (
                     r.get("id")
                     and isinstance(r.get("vector"), list)
                     and len(r["vector"]) == EMBEDDING_DIM
-                ):
-                    vectors.append(
-                        (r["id"], r["vector"], r.get("metadata", {}))
-                    )
+                )
+            ]
 
             if vectors:
-                self.index.upsert(vectors=vectors, namespace=namespace)
+                self.index.upsert(
+                    vectors=vectors,
+                    namespace=namespace
+                )
 
     # -------------------------------------------------
-    # QUERY (STRICT)
+    # QUERY (HOT PATH OPTIMIZED)
     # -------------------------------------------------
 
     def query(
@@ -97,11 +131,8 @@ class VectorStore:
         namespace: str = DEFAULT_NAMESPACE
     ) -> List[Dict]:
 
-        if (
-            not query_vector
-            or not isinstance(query_vector, list)
-            or len(query_vector) != EMBEDDING_DIM
-        ):
+        # ---- fast reject ----
+        if not query_vector or len(query_vector) != EMBEDDING_DIM:
             return []
 
         try:
@@ -116,17 +147,19 @@ class VectorStore:
             return []
 
         matches = response.get("matches") or []
-        cleaned = []
+        if not matches:
+            return []
+
+        cleaned: List[Dict] = []
 
         for m in matches:
             score = m.get("score", 0.0)
-            meta = m.get("metadata") or {}
-
             if score < MIN_RAW_SCORE:
                 continue
 
-            if not REQUIRED_METADATA_FIELDS.issubset(meta.keys()):
-                continue  # 🔑 incomplete chunk → reject
+            meta = m.get("metadata") or {}
+            if not REQUIRED_METADATA_FIELDS.issubset(meta):
+                continue
 
             cleaned.append({
                 "id": m.get("id"),
