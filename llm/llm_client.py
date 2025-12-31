@@ -1,21 +1,21 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 import os
 import logging
 import re
 from typing import Optional
 
-from dotenv import load_dotenv
-load_dotenv(override=True)
-
 import torch
 from transformers import pipeline
 
-# Gemini SDK
 from google import genai
 from google.genai import types
 
 
-# ---------------- GLOBAL SINGLETONS ----------------
-# 🔑 Prevents repeated heavy initialization
+# ============================================================
+# GLOBAL SINGLETONS (CRITICAL FOR PERFORMANCE & STABILITY)
+# ============================================================
 
 _LOCAL_PIPE = None
 _LOCAL_TOKENIZER = None
@@ -28,12 +28,11 @@ class LLMClient:
 
     LOCAL (FLAN-T5):
         - RAG answers ONLY
-        - Grounded extraction
-        - Deterministic output
+        - Deterministic, grounded
 
     GEMINI:
         - Definitions
-        - Safe fallback
+        - Fallback answers
         - General agriculture knowledge
     """
 
@@ -41,8 +40,8 @@ class LLMClient:
         self,
         local_model: str = "google/flan-t5-base",
         max_input_tokens: int = 1024,
-        max_output_tokens: int = 256,
-        provider: str = "local",  # "local" | "gemini"
+        max_output_tokens: int = 4096,   # 🔥 increased (fixes short UI answers)
+        provider: str = "local",        # "local" | "gemini"
     ):
         self.provider = provider
         self.max_input_tokens = max_input_tokens
@@ -54,6 +53,8 @@ class LLMClient:
         if self.provider == "local":
             if _LOCAL_PIPE is None:
                 device = 0 if torch.cuda.is_available() else -1
+                logging.info(f"🔧 Initializing FLAN-T5 on device={device}")
+
                 _LOCAL_PIPE = pipeline(
                     task="text2text-generation",
                     model=local_model,
@@ -69,7 +70,9 @@ class LLMClient:
             if _GEMINI_CLIENT is None:
                 api_key = os.getenv("GEMINI_API_KEY")
                 if not api_key:
-                    raise RuntimeError("GEMINI_API_KEY is missing")
+                    raise RuntimeError("❌ GEMINI_API_KEY is missing")
+
+                logging.info("🔑 Initializing Gemini client")
                 _GEMINI_CLIENT = genai.Client(api_key=api_key)
 
             self.gemini_client = _GEMINI_CLIENT
@@ -77,13 +80,14 @@ class LLMClient:
         else:
             raise ValueError(f"Unknown provider: {self.provider}")
 
-    # -------------------------------------------------
+    # ============================================================
     # UTILS
-    # -------------------------------------------------
+    # ============================================================
 
     def _truncate(self, text: str) -> str:
-        if not self.tokenizer:
+        if not hasattr(self, "tokenizer") or not self.tokenizer:
             return text
+
         tokens = self.tokenizer.encode(
             text,
             truncation=True,
@@ -92,9 +96,6 @@ class LLMClient:
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
     def _dedupe_repetition(self, text: str) -> str:
-        """
-        Hard stop for FLAN-T5 repetition loops.
-        """
         sentences = re.split(r"(?<=[.!?])\s+", text)
         seen = set()
         clean = []
@@ -110,9 +111,9 @@ class LLMClient:
 
         return " ".join(clean)
 
-    # -------------------------------------------------
+    # ============================================================
     # GENERATE
-    # -------------------------------------------------
+    # ============================================================
 
     def generate(
         self,
@@ -123,7 +124,10 @@ class LLMClient:
     ) -> str:
         """
         Generate text using selected provider.
-        NEVER raises to API layer.
+
+        🔴 RULE:
+        - NEVER silently return empty string
+        - Fail loudly in logs, softly in output
         """
 
         # ================= LOCAL (FLAN-T5) =================
@@ -150,35 +154,37 @@ class LLMClient:
                 )
 
                 text = output[0]["generated_text"].strip()
-                return self._dedupe_repetition(text)
+                text = self._dedupe_repetition(text)
+
+                return text or "Answer could not be generated from the documents."
 
             except Exception:
                 logging.exception("❌ Local LLM failed")
-                return ""
+                return "Answer could not be generated from the documents."
 
         # ================= GEMINI =================
         if self.provider == "gemini":
             try:
                 response = self.gemini_client.models.generate_content(
-                    model="gemini-1.5-flash",
+                    model="models/gemini-flash-latest",  # ✅ FREE-TIER SAFE
                     contents=f"{system_prompt}\n\n{user_prompt}",
                     config=types.GenerateContentConfig(
                         temperature=temperature,
                         max_output_tokens=max_tokens or self.max_output_tokens,
                     ),
-                    timeout=10,  # 🔑 HARD TIMEOUT (major latency win)
                 )
 
                 text = (response.text or "").strip()
 
-                # Safety: reject garbage / empty answers
-                if len(text.split()) < 6:
-                    return ""
+                # 🔥 IMPORTANT: DO NOT DROP SHORT ANSWERS
+                if not text:
+                    logging.error("❌ Gemini returned empty response")
+                    return "Definition not available at the moment."
 
                 return text
 
-            except Exception:
-                logging.exception("❌ Gemini failed")
-                return ""
+            except Exception as e:
+                logging.exception(f"❌ Gemini failed: {e}")
+                return "Definition service is temporarily unavailable."
 
-        return ""
+        return "Unable to generate answer."

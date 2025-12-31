@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env", override=True)
+
 import os
 import sys
 import shutil
@@ -29,7 +32,7 @@ from embeddings.vector_store import VectorStore
 app = FastAPI(
     title="Agri-RAG API",
     description="Evidence-bound agricultural QA system",
-    version="2.2.1",
+    version="2.2.2",
 )
 
 app.add_middleware(
@@ -49,7 +52,7 @@ STATE_FILE = os.path.join(DATA_DIR, "vector_store", "index_state.json")
 os.makedirs(PDF_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
-# ---------------- STATE UTILS (🔥 FIXED) ----------------
+# ---------------- STATE UTILS ----------------
 
 def _file_hash(path: str) -> str:
     h = hashlib.sha256()
@@ -58,14 +61,12 @@ def _file_hash(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-
 def _load_state() -> Dict[str, str]:
     if not os.path.exists(STATE_FILE):
         return {}
     import json
     with open(STATE_FILE, "r") as f:
         return json.load(f)
-
 
 def _save_state(state: Dict[str, str]) -> None:
     import json
@@ -76,10 +77,18 @@ def _save_state(state: Dict[str, str]) -> None:
 
 @app.on_event("startup")
 def startup_event():
-    app.state.embedder = Embedder()
-    app.state.vector_store = VectorStore()
-    app.state.rag = RAGPipeline()
+    embedder = Embedder()
+    vector_store = VectorStore()
+
+    app.state.embedder = embedder
+    app.state.vector_store = vector_store
+    app.state.rag = RAGPipeline(
+        vector_store=vector_store,
+        embedder=embedder
+    )
+    # 🔥 SINGLE Gemini instance
     app.state.gemini_llm = LLMClient(provider="gemini")
+
     print("✅ Agri-RAG API ready")
 
 # ---------------- DOMAIN GUARDS ----------------
@@ -101,34 +110,16 @@ DEFINITION_TRIGGERS = (
 )
 
 def is_agriculture_query(q: str) -> bool:
-    q = q.lower()
-    return any(k in q for k in AGRI_KEYWORDS)
+    return any(k in q.lower() for k in AGRI_KEYWORDS)
 
 def looks_like_person_query(q: str) -> bool:
-    q = q.lower()
-    return any(re.search(p, q) for p in PERSON_PATTERNS)
+    return any(re.search(p, q.lower()) for p in PERSON_PATTERNS)
 
 def is_definition_query(q: str) -> bool:
-    return q.lower().strip().startswith(DEFINITION_TRIGGERS)
-
-# ---------------- DEFINITION CACHE ----------------
-
-@lru_cache(maxsize=256)
-def cached_definition(question: str) -> str:
-    return app.state.gemini_llm.generate(
-        system_prompt=(
-            "You are an agricultural expert.\n"
-            "Give a clear, textbook-style definition.\n"
-            "No advice. No recommendations. No sources."
-        ),
-        user_prompt=question,
-        temperature=0.3,
-        max_tokens=220,
-    ).strip()
+    q = q.lower().strip()
+    return any(q.startswith(t) for t in DEFINITION_TRIGGERS)
 
 # ---------------- RAG CACHE ----------------
-# ⚠️ NOTE: cache is cleared automatically on restart.
-# Good enough for demo + evaluation.
 
 @lru_cache(maxsize=512)
 def cached_rag_answer(
@@ -175,7 +166,6 @@ def chat(req: ChatRequest):
     if not raw:
         raise HTTPException(400, "Empty question")
 
-    # ---------- FAST HARD REJECT ----------
     if looks_like_person_query(raw):
         return ChatResponse(
             status="no_answer",
@@ -194,16 +184,28 @@ def chat(req: ChatRequest):
             suggestion="Rephrase with an agriculture focus."
         )
 
-    # ---------- FAST DEFINITION ----------
+    # ================= DEFINITIONS (GEMINI ONLY) =================
     if is_definition_query(raw):
+        answer = app.state.gemini_llm.generate(
+            system_prompt=(
+                "You are an agricultural expert.\n"
+                "Give a clear, textbook-style definition.\n"
+                "No advice. No recommendations."
+            ),
+            user_prompt=raw,
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        # 🔥 NEVER ERROR — ALWAYS RETURN TEXT
         return ChatResponse(
             status="answer",
-            answer=cached_definition(raw),
+            answer=answer or "Definition not available at the moment.",
             confidence=0.7,
             diagnostics={"category": "definition"}
         )
 
-    # ---------- CACHED RAG ----------
+    # ================= RAG =================
     result = cached_rag_answer(
         raw,
         req.intent,
@@ -211,21 +213,36 @@ def chat(req: ChatRequest):
         req.category
     )
 
-    if result["status"] == "answer":
+    if result.get("status") == "answer":
         return ChatResponse(
             status="answer",
-            answer=result["answer"],
-            confidence=result["confidence"],
+            answer=result.get("answer"),
+            confidence=result.get("confidence", 0.0),
             diagnostics=result.get("diagnostics")
+        )
+
+    # ================= GEMINI FALLBACK =================
+    fallback = app.state.gemini_llm.generate(
+        system_prompt="You are an agricultural expert.",
+        user_prompt=raw,
+        temperature=0.3,
+        max_tokens=350,
+    )
+
+    if fallback:
+        return ChatResponse(
+            status="answer",
+            answer=fallback,
+            confidence=0.6,
+            diagnostics={"fallback": "gemini"}
         )
 
     return ChatResponse(
         status="no_answer",
         answer=None,
-        confidence=result.get("confidence", 0.0),
-        message=result.get("message"),
-        suggestion=result.get("suggestion"),
-        diagnostics=result.get("diagnostics")
+        confidence=0.0,
+        message="Unable to answer with available information.",
+        suggestion="Try rephrasing or upload relevant documents."
     )
 
 # ---------------- PDF UPLOAD ----------------

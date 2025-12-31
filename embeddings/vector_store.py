@@ -132,7 +132,12 @@ class VectorStore:
     ) -> List[Dict]:
 
         # ---- fast reject ----
-        if not query_vector or len(query_vector) != EMBEDDING_DIM:
+        if (
+            not isinstance(query_vector, list)
+            or not query_vector
+            or not all(isinstance(x, (int, float)) for x in query_vector)
+            or len(query_vector) != EMBEDDING_DIM
+        ):
             return []
 
         try:

@@ -2,12 +2,15 @@ from typing import List, Dict
 
 # ---------------- CONFIG ----------------
 
+# NORMAL MODE (RAG)
 MAX_CONTEXT_CHUNKS = 6
-MAX_CONTEXT_CHARS = 8000
+MAX_CONTEXT_CHARS = 6000
+MAX_CHARS_PER_CHUNK = 900   # 🔥 MOST IMPORTANT FIX
 
-# FAST trimming (used implicitly by pipeline)
+# FAST MODE (definition / policy)
 FAST_MAX_CHUNKS = 2
-FAST_MAX_CHARS = 2500
+FAST_MAX_CHARS = 2200
+FAST_MAX_CHARS_PER_CHUNK = 700
 
 
 class PromptBuilder:
@@ -16,40 +19,56 @@ class PromptBuilder:
 
     Responsibilities:
     - Context selection
-    - Context structuring
-    - Instruction hardening
+    - Context trimming
+    - Prompt safety
 
-    NO refusal logic.
-    NO confidence logic.
-    NO category decisions.
+    NO confidence logic
+    NO refusal logic
     """
 
     # ---------------- MAIN ----------------
 
-    def build(self, query: str, retrieved_chunks: List[Dict]) -> Dict:
+    def build(
+        self,
+        query: str,
+        retrieved_chunks: List[Dict],
+        fast_mode: bool = False,   # 🔥 PIPELINE SHOULD PASS THIS
+    ) -> Dict:
+
         used = []
         seen = set()
         total_chars = 0
 
-        # conservative defaults (pipeline controls how many chunks it passes)
-        max_chunks = MAX_CONTEXT_CHUNKS
-        max_chars = MAX_CONTEXT_CHARS
+        if fast_mode:
+            max_chunks = FAST_MAX_CHUNKS
+            max_chars = FAST_MAX_CHARS
+            max_per_chunk = FAST_MAX_CHARS_PER_CHUNK
+        else:
+            max_chunks = MAX_CONTEXT_CHUNKS
+            max_chars = MAX_CONTEXT_CHARS
+            max_per_chunk = MAX_CHARS_PER_CHUNK
 
         for c in retrieved_chunks:
             cid = c.get("chunk_id")
             if not cid or cid in seen:
                 continue
 
-            text = (c.get("text") or "").strip()
-            if not text:
+            raw_text = (c.get("text") or "").strip()
+            if not raw_text:
                 continue
 
+            # 🔥 HARD TRIM PER CHUNK
+            text = raw_text[:max_per_chunk]
             text_len = len(text)
+
             if total_chars + text_len > max_chars:
                 break
 
+            c_copy = dict(c)
+            c_copy["text"] = text
+
             seen.add(cid)
-            used.append(c)
+            used.append(c_copy)
             total_chars += text_len
 
             if len(used) >= max_chunks:
@@ -61,25 +80,26 @@ class PromptBuilder:
             "system_prompt": self._system_prompt(),
             "user_prompt": self._user_prompt(query, context),
             "used_chunks": used,
+            "stats": {
+                "chunks_used": len(used),
+                "context_chars": total_chars,
+                "fast_mode": fast_mode,
+            },
         }
 
-    # ---------------- PROMPT BUILDING ----------------
+    # ---------------- PROMPTS ----------------
 
     def _system_prompt(self) -> str:
-        """
-        Hard constraints that survive prompt injection.
-        """
         return (
             "SYSTEM ROLE: Agricultural Information Assistant\n\n"
-            "NON-NEGOTIABLE RULES:\n"
-            "1. Answer ONLY using the provided CONTEXT.\n"
-            "2. Do NOT use prior knowledge.\n"
-            "3. Do NOT infer, assume, or generalize.\n"
-            "4. If the answer is NOT explicitly stated, reply EXACTLY:\n"
+            "RULES:\n"
+            "1. Answer ONLY from the provided CONTEXT.\n"
+            "2. Do NOT use outside knowledge.\n"
+            "3. Do NOT infer or assume missing information.\n"
+            "4. If the answer is missing, reply exactly:\n"
             "   'Not found in the provided documents.'\n"
-            "5. For numeric information, rely ONLY on tables if present.\n"
-            "6. Do NOT give recommendations unless explicitly written.\n"
-            "7. Avoid definitive or prescriptive language.\n"
+            "5. Use tables for numeric answers when available.\n"
+            "6. Be precise and concise.\n"
         )
 
     def _user_prompt(self, query: str, context: str) -> str:
@@ -94,31 +114,22 @@ class PromptBuilder:
     # ---------------- CONTEXT FORMAT ----------------
 
     def _format_context(self, chunks: List[Dict]) -> str:
-        """
-        Compact, structured context.
-        Metadata kept minimal to reduce token load.
-        """
         formatted = []
 
         for i, c in enumerate(chunks, start=1):
-            source = c.get("source")
-            page = c.get("page")
-            ctype = c.get("content_type", "text")
+            header = []
 
-            header_parts = []
-            if source:
-                header_parts.append(f"Source: {source}")
-            if page is not None:
-                header_parts.append(f"Page: {page}")
-            if ctype:
-                header_parts.append(f"Type: {ctype}")
-
-            header = " | ".join(header_parts)
+            if c.get("source"):
+                header.append(f"Source: {c['source']}")
+            if c.get("page") is not None:
+                header.append(f"Page: {c['page']}")
+            if c.get("content_type"):
+                header.append(f"Type: {c['content_type']}")
 
             block = (
                 f"[CONTEXT {i}]\n"
-                f"{header}\n"
-                f"{c.get('text','')}"
+                f"{' | '.join(header)}\n"
+                f"{c.get('text', '')}"
             )
 
             formatted.append(block)

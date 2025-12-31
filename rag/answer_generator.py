@@ -55,7 +55,7 @@ class AnswerGenerator:
             system_prompt=prompt_bundle["system_prompt"],
             user_prompt=prompt_bundle["user_prompt"],
             temperature=0.0,
-            max_tokens=256,  # 🔥 reduced safely
+            max_tokens=512,  # 🔥 reduced safely
         )
 
         if not answer:

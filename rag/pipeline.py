@@ -14,14 +14,13 @@ CATEGORY_CONFIDENCE_CAPS = {
     "market": 0.9,
     "advisory": 0.65,
     "disease": 0.5,
-    "definition": 0.7,
 }
 
 MANDATORY_TEXT_DOMINANCE = {"policy", "market"}
 OCR_FORBIDDEN_CATEGORIES = {"policy", "disease"}
 TABLE_REQUIRED_CATEGORIES = {"market"}
 
-FAST_CATEGORIES = {"policy", "definition"}
+FAST_CATEGORIES = {"policy"}  # definition is NOT RAG
 
 
 # ---------------- USER-FACING FALLBACK MESSAGES ----------------
@@ -53,15 +52,11 @@ NO_ANSWER_MESSAGES = {
 class RAGPipeline:
     """
     Final decision authority.
-
-    Optimized guarantees:
-    - No unnecessary LLM calls
-    - Category guards evaluated BEFORE generation
-    - Fast-path behavior is real, not symbolic
     """
 
-    def __init__(self):
-        self.retriever = Retriever()
+    def __init__(self, vector_store, embedder):
+        self.embedder = embedder
+        self.retriever = Retriever(vector_store)
         self.prompt_builder = PromptBuilder()
         self.answer_generator = AnswerGenerator()
 
@@ -79,8 +74,12 @@ class RAGPipeline:
         fast_mode = category in FAST_CATEGORIES
 
         # ---------------- RETRIEVAL ----------------
+        # ✅ FIXED: always returns List[List[float]]
+        query_vectors = self.embedder.embed_texts([query])  # List[List[float]]
+
         retrieval = self.retriever.retrieve(
             query=query,
+            query_vectors=query_vectors,
             intent=intent,
             language=language
         )
@@ -91,18 +90,21 @@ class RAGPipeline:
             "retrieval": retrieval_diag,
         }
 
-        # ---------- HARD FAIL (NO COST) ----------
+        # ---------- HARD FAIL ----------
         if retrieval_diag.get("status") != "ok":
             return self._fallback("retrieval_failed", diagnostics)
 
-        chunks = retrieval.get("chunks")
+        chunks = retrieval.get("chunks") or []
         if not chunks:
             return self._fallback("no_chunks", diagnostics)
 
         retrieval_confidence = retrieval_diag.get("retrieval_confidence", 0.0)
+        if retrieval_confidence <= 0.05:
+            return self._fallback("retrieval_failed", diagnostics)
+
         content_mix = retrieval_diag.get("content_mix", {})
 
-        # ---------------- CATEGORY GUARDS (CHEAP & EARLY) ----------------
+        # ---------------- CATEGORY GUARDS ----------------
 
         if category in OCR_FORBIDDEN_CATEGORIES and content_mix.get("ocr", 0) > 0:
             return self._fallback("category_violation", diagnostics)
@@ -114,13 +116,16 @@ class RAGPipeline:
             if (content_mix.get("text", 0) + content_mix.get("procedure", 0)) == 0:
                 return self._fallback("category_violation", diagnostics)
 
-        # ---------------- PROMPT (FAST PATH OPTIMIZATION) ----------------
+        # ---------------- PROMPT ----------------
         prompt_bundle = self.prompt_builder.build(
             query=query,
             retrieved_chunks=chunks
         )
 
-        # ---------------- ANSWER GENERATION ----------------
+        if not prompt_bundle or not prompt_bundle.get("used_chunks"):
+            return self._fallback("no_chunks", diagnostics)
+
+        # ---------------- ANSWER ----------------
         answer_result = self.answer_generator.generate(prompt_bundle)
 
         hallucinated = answer_result.get("hallucinated", False)
@@ -137,7 +142,6 @@ class RAGPipeline:
 
         # ---------------- CONFIDENCE FUSION ----------------
         if fast_mode:
-            # Policy facts → trust retrieval more
             final_confidence = round(
                 0.65 * retrieval_confidence +
                 0.35 * answer_confidence,
@@ -150,7 +154,6 @@ class RAGPipeline:
                 3
             )
 
-        # ---------------- CATEGORY CONFIDENCE CAP ----------------
         final_confidence = min(
             final_confidence,
             CATEGORY_CONFIDENCE_CAPS.get(category, 1.0)

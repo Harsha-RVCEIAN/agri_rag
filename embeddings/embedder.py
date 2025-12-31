@@ -10,13 +10,10 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_VERSION = "minilm_v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Dynamic batch sizing
 BATCH_SIZE = 64 if DEVICE == "cuda" else 16
 
 
 # ---------------- GLOBAL SINGLETON ----------------
-# 🔑 Prevent repeated model loads
 
 _MODEL = None
 
@@ -37,8 +34,9 @@ def _get_model() -> SentenceTransformer:
 class Embedder:
     """
     Responsible ONLY for:
-    - embedding text (queries or chunks)
-    - normalizing vectors
+    - embedding queries
+    - embedding document chunks
+    - returning normalized vectors
     """
 
     def __init__(self):
@@ -76,29 +74,35 @@ class Embedder:
     @lru_cache(maxsize=1024)
     def _embed_single_query(self, text: str) -> List[float]:
         """
-        Cache single-query embeddings.
-        Massive latency win for repeated questions.
+        Cached single-query embedding.
         """
-        vec = self._embed([text])
-        return vec[0] if vec else []
+        vecs = self._embed([text])
+        return vecs[0] if vecs else []
+
+    def embed_query(self, query: str) -> List[float]:
+        """
+        PUBLIC API for query embedding.
+        This is what Retriever / Pipeline should call.
+        """
+        if not isinstance(query, str) or not query.strip():
+            return []
+        return self._embed_single_query(query.strip())
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
         """
-        Embed query texts.
-        Uses cache for single queries.
+        Embed multiple texts.
         """
         clean = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
         if not clean:
             return []
 
-        # Fast path: single query
         if len(clean) == 1:
             return [self._embed_single_query(clean[0])]
 
         return self._embed(clean)
 
     # -------------------------------------------------
-    # CHUNK EMBEDDING (UNCHANGED SEMANTICS)
+    # CHUNK EMBEDDING
     # -------------------------------------------------
 
     def embed_chunks(self, chunks: List[Dict]) -> List[Dict]:

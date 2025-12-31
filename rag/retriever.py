@@ -34,10 +34,11 @@ SINGLE_PAGE_PENALTY = 0.90
 class Retriever:
     """
     Evidence-first retriever.
-    Optimized for:
-    - minimal overhead
-    - early rejection
-    - strict correctness
+
+    CONTRACT (STRICT):
+    - Accepts EMBEDDINGS ONLY
+    - Never embeds text
+    - Never sees raw query strings
     """
 
     def __init__(self, vector_store):
@@ -65,7 +66,9 @@ class Retriever:
         meta = m["metadata"]
         score = m["norm_score"]
 
-        score *= CONTENT_TYPE_WEIGHT.get(meta.get("content_type", "text"), 1.0)
+        score *= CONTENT_TYPE_WEIGHT.get(
+            meta.get("content_type", "text"), 1.0
+        )
 
         conf = meta.get("confidence", 1.0)
         if conf < 0.6:
@@ -82,8 +85,11 @@ class Retriever:
     # ---------- INTENT CONSTRAINT ----------
 
     def _enforce_intent(
-        self, chunks: List[Dict], intent: Optional[str]
+        self,
+        chunks: List[Dict],
+        intent: Optional[str],
     ) -> Optional[str]:
+
         if not intent or intent not in INTENT_REQUIREMENTS:
             return None
 
@@ -94,7 +100,7 @@ class Retriever:
 
         return None
 
-    # ---------- MAIN ----------
+    # ---------- MAIN RETRIEVAL ----------
 
     def retrieve(
         self,
@@ -108,9 +114,9 @@ class Retriever:
         filters = {"language": {"$eq": language}} if language else None
 
         raw: List[Dict] = []
-        for v in query_vectors:
+        for vec in query_vectors:
             res = self.vector_store.query(
-                query_vector=v,
+                query_vector=vec,
                 top_k=OVERFETCH_K,
                 filters=filters,
             )
@@ -120,7 +126,10 @@ class Retriever:
         if not raw:
             return {
                 "chunks": [],
-                "diagnostics": {"status": "fail", "reason": "no_matches"},
+                "diagnostics": {
+                    "status": "fail",
+                    "reason": "no_matches",
+                },
             }
 
         # ---------- NORMALIZE ----------
@@ -137,16 +146,13 @@ class Retriever:
         candidates = sorted(
             merged.values(),
             key=lambda x: x["norm_score"],
-            reverse=True
+            reverse=True,
         )[:MAX_MERGED_CANDIDATES]
 
         # ---------- RANKING + DIVERSITY ----------
         page_count = defaultdict(int)
         source_count = defaultdict(int)
         ranked: List[Dict] = []
-
-        adjust = self._adjust
-        min_score = MIN_ADJUSTED_SCORE
 
         for m in candidates:
             meta = m["metadata"]
@@ -158,8 +164,8 @@ class Retriever:
             if source and source_count[source] >= MAX_CHUNKS_PER_SOURCE:
                 continue
 
-            score = adjust(m)
-            if score < min_score:
+            score = self._adjust(m)
+            if score < MIN_ADJUSTED_SCORE:
                 continue
 
             page_count[page] += 1
@@ -176,14 +182,16 @@ class Retriever:
                 "text": meta.get("text", ""),
             })
 
-            # EARLY EXIT (safe)
             if len(ranked) >= top_k * 2:
                 break
 
         if len(ranked) < MIN_COVERAGE_CHUNKS:
             return {
                 "chunks": [],
-                "diagnostics": {"status": "fail", "reason": "insufficient_coverage"},
+                "diagnostics": {
+                    "status": "fail",
+                    "reason": "insufficient_coverage",
+                },
             }
 
         ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -191,14 +199,20 @@ class Retriever:
         if ranked[0]["score"] < WEAK_RETRIEVAL_THRESHOLD:
             return {
                 "chunks": [],
-                "diagnostics": {"status": "fail", "reason": "low_confidence"},
+                "diagnostics": {
+                    "status": "fail",
+                    "reason": "low_confidence",
+                },
             }
 
         intent_issue = self._enforce_intent(ranked, intent)
         if intent_issue:
             return {
                 "chunks": [],
-                "diagnostics": {"status": "fail", "reason": intent_issue},
+                "diagnostics": {
+                    "status": "fail",
+                    "reason": intent_issue,
+                },
             }
 
         # ---------- CONFIDENCE ----------
@@ -220,7 +234,7 @@ class Retriever:
 
         retrieval_confidence = round(
             (0.6 * mx + 0.3 * avg + 0.1 * agreement) * penalty,
-            3
+            3,
         )
 
         return {
@@ -229,7 +243,9 @@ class Retriever:
                 "status": "ok",
                 "intent": intent,
                 "retrieval_confidence": retrieval_confidence,
-                "content_mix": dict(Counter(c["content_type"] for c in top)),
+                "content_mix": dict(
+                    Counter(c["content_type"] for c in top)
+                ),
                 "source_diversity": source_diversity,
                 "page_diversity": page_diversity,
             },
