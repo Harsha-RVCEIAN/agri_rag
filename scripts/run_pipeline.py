@@ -1,42 +1,62 @@
 # scripts/run_pipeline.py
 
-import sys
 import os
+import sys
 
 # ---- ensure project root is on path ----
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from rag.retriever import Retriever
-from llm.answerer import generate_answer
+from embeddings.embedder import Embedder
+from embeddings.vector_store import VectorStore
+from rag.pipeline import RAGPipeline
 
 
 def main():
-    print("🚀 Agri-RAG Query Runner")
+    print("🚀 Agri-RAG CLI Runner")
+    print("Type 'exit' to quit.\n")
 
-    # ---- user query ----
-    query = "what is features of PMFBY?"
+    # ---- init core components ----
+    embedder = Embedder()
+    vector_store = VectorStore()
 
-    # ---- retrieve evidence ----
-    retriever = Retriever()
-    result = retriever.retrieve(query)
+    rag = RAGPipeline(
+        vector_store=vector_store,
+        embedder=embedder
+    )
 
-    chunks = result.get("chunks", [])
-    diagnostics = result.get("diagnostics", {})
+    while True:
+        query = input("❓ Question: ").strip()
+        if not query:
+            continue
+        if query.lower() in {"exit", "quit"}:
+            break
 
-    print(f"🔎 Retrieved chunks: {len(chunks)}")
-    print(f"🧪 Diagnostics: {diagnostics}")
+        # ---- optional knobs ----
+        intent = None        # e.g. "eligibility", "procedure"
+        language = None      # e.g. "en"
+        category = None      # e.g. "policy", "market", "disease"
 
-    if not chunks:
-        print("\n❌ ANSWER:\nNot found in the provided documents.")
-        return
+        result = rag.run(
+            query=query,
+            intent=intent,
+            language=language,
+            category=category,
+        )
 
-    # ---- generate answer ----
-    answer = generate_answer(query, chunks)
-    print("\nquery:\n", query)
-    print("\n🧠 ANSWER:\n")
-    print(answer)
+        print("\n🧠 RESULT")
+        print("────────────")
+
+        if result["status"] == "answer":
+            print("Answer:")
+            print(result["answer"])
+            print(f"\nConfidence: {result['confidence']}")
+        else:
+            print(result.get("message", "No answer."))
+            print("Suggestion:", result.get("suggestion"))
+
+        print("\n" + "=" * 50 + "\n")
 
 
 if __name__ == "__main__":

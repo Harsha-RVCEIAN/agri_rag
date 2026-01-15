@@ -1,152 +1,672 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Agri-RAG Assistant</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Agri-Connect AI</title>
 
-    <!-- ✅ Markdown parser -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f4f6f8;
-            padding: 40px;
-        }
+<style>
+:root {
+  --green-dark: #1b5e20;
+  --green-main: #43a047;
+}
 
-        .chat-box {
-            max-width: 900px;
-            margin: auto;
-            background: white;
-            padding: 24px;
-            border-radius: 8px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-        }
+* { box-sizing: border-box; }
 
-        textarea {
-            width: 100%;
-            height: 100px;
-            padding: 12px;
-            font-size: 15px;
-            resize: vertical;
-        }
+body {
+  margin: 0;
+  height: 100vh;
+  background:
+    radial-gradient(circle at center, #eef7e8 0%, #cfe6c3 60%, #b7d7a8 100%);
+  font-family: Inter, system-ui, sans-serif;
+  display: flex;
+}
 
-        button {
-            margin-top: 12px;
-            padding: 10px 18px;
-            font-size: 14px;
-            cursor: pointer;
-        }
+/* ===== Layout ===== */
+.app {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
 
-        .answer-box {
-            max-height: 400px;
-            overflow-y: auto;
-            border-top: 1px solid #eee;
-            margin-top: 20px;
-            padding-top: 10px;
-        }
+/* ===== Sidebar ===== */
+.sidebar {
+  width: 260px;
+  background: rgba(255,255,255,0.28);
+  backdrop-filter: blur(18px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: background 0.25s ease;
+}
 
-        .answer {
-            font-size: 15px;
-            line-height: 1.6;
-        }
+.new-chat {
+  padding: 12px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #4caf50, #81c784);
+  color: white;
+  text-align: center;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
 
-        .answer ul {
-            padding-left: 20px;
-        }
+.new-chat:hover {
+  transform: translateY(-1px);
+}
 
-        .answer strong {
-            font-weight: 600;
-        }
+.divider {
+  height: 1px;
+  background: rgba(0,0,0,0.08);
+  margin: 4px 0;
+}
 
-        .meta {
-            margin-top: 12px;
-            font-size: 12px;
-            color: #555;
-        }
+.chat-list {
+  flex: 1;
+  overflow-y: auto;
+}
 
-        .warning {
-            color: #b00020;
-            font-weight: bold;
-        }
+.chat-item {
+  padding: 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: background 0.2s ease;
+}
 
-        .loading {
-            color: #444;
-        }
-    </style>
+.chat-item:hover {
+  background: rgba(255,255,255,0.35);
+}
+
+.chat-item.active {
+  background: rgba(255,255,255,0.6);
+  font-weight: 600;
+}
+
+.chat-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-btn {
+  opacity: 0.55;
+  cursor: pointer;
+  transition: opacity 0.2s ease;
+}
+
+.menu-btn:hover {
+  opacity: 1;
+}
+
+/* ===== Context Menu ===== */
+.context-menu {
+  position: fixed;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.18);
+  padding: 6px 0;
+  z-index: 1000;
+  min-width: 150px;
+}
+
+.context-menu div {
+  padding: 10px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.context-menu div:hover {
+  background: #f1f5f1;
+}
+
+.context-menu .danger {
+  color: #c62828;
+}
+
+.hidden { display: none; }
+
+/* ===== Main ===== */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+}
+
+.header {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  color: var(--green-dark);
+}
+
+.subheader {
+  font-size: 13px;
+  opacity: 0.8;
+  margin-top: 2px;
+}
+
+/* ===== Chat ===== */
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ===== Onboarding ===== */
+.onboarding {
+  margin: auto;
+  text-align: center;
+  color: #2e7d32;
+}
+
+.onboarding h2 {
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+.onboarding p {
+  opacity: 0.8;
+}
+
+/* ===== Messages ===== */
+.msg-wrapper {
+  max-width: 70%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.msg-wrapper.user { align-self: flex-end; }
+.msg-wrapper.bot { align-self: flex-start; }
+
+.msg {
+  padding: 13px 18px;
+  border-radius: 18px;
+  font-size: 14px;
+}
+
+.msg.user {
+  background: linear-gradient(135deg, #4caf50, #81c784);
+  color: white;
+}
+
+.msg.bot {
+  background: rgba(255,255,255,0.85);
+  border-left: 4px solid var(--green-main);
+}
+
+/* ===== Copy ===== */
+.copy-btn {
+  align-self: flex-end;
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(0,0,0,0.2);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  cursor: pointer;
+  background: rgba(255,255,255,0.6);
+}
+
+/* ===== Input ===== */
+.input-bar {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+  background: rgba(255,255,255,0.95);
+  border-radius: 999px;
+  padding: 12px;
+  box-shadow: 0 10px 28px rgba(0,0,0,0.14);
+  transition: box-shadow 0.25s ease;
+}
+
+.input-bar:focus-within {
+  box-shadow: 0 12px 34px rgba(0,0,0,0.18);
+}
+
+.input-bar input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  padding: 8px 12px;
+}
+
+.send,
+.mic {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  color: white;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.send {
+  background: radial-gradient(circle at 30% 30%, #7cff7c, #2e7d32);
+}
+
+.send:hover {
+  box-shadow: 0 0 10px rgba(67,160,71,0.45);
+}
+
+.mic {
+  background: radial-gradient(circle at 30% 30%, #ff9a90, #c62828);
+  opacity: 0.85;
+}
+
+.mic:hover {
+  opacity: 1;
+}
+.voice-overlay {
+  position: absolute;
+  bottom: 120px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(255,255,255,0.9);
+  padding: 14px 18px;
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+}
+
+.voice-overlay.hidden {
+  display: none;
+}
+
+.waveform {
+  display: flex;
+  gap: 3px;
+}
+
+.waveform span {
+  width: 4px;
+  height: 10px;
+  background: var(--green-main);
+  border-radius: 2px;
+  animation: pulse 1s infinite ease-in-out;
+}
+
+@keyframes pulse {
+  0% { height: 6px; }
+  50% { height: 18px; }
+  100% { height: 6px; }
+}
+
+/* ===== Config Modal ===== */
+.config-modal {
+  display: flex;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,0.5);
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.config-modal.hidden {
+  display: none;
+}
+
+.config-content {
+  background: white;
+  padding: 30px;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  max-width: 400px;
+  text-align: center;
+}
+
+.config-content h2 {
+  color: #2e7d32;
+  margin-top: 0;
+}
+
+.config-content p {
+  color: #666;
+  font-size: 14px;
+}
+
+.config-input {
+  width: 100%;
+  padding: 12px;
+  margin: 10px 0;
+  border: 2px solid #ddd;
+  border-radius: 8px;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+.config-input:focus {
+  outline: none;
+  border-color: #43a047;
+}
+
+.config-button {
+  width: 100%;
+  padding: 12px;
+  margin: 10px 0;
+  background: #43a047;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.2s ease;
+}
+
+.config-button:hover {
+  background: #2e7d32;
+}
+
+</style>
 </head>
+
 <body>
 
-<div class="chat-box">
-    <h2>🌾 Agri-RAG Assistant</h2>
-
-    <textarea
-        id="question"
-        placeholder="Ask an agriculture-related question (schemes, crops, practices)..."
-    ></textarea>
-
-    <button onclick="askQuestion()">Ask</button>
-
-    <div class="answer-box">
-        <div id="output" class="answer"></div>
-    </div>
-
-    <div id="meta" class="meta"></div>
+<div id="configModal" class="config-modal">
+  <div class="config-content">
+    <h2>⚙️ Backend Configuration</h2>
+    <p>Enter the IP address of your backend server</p>
+    <input 
+      type="text" 
+      id="backendIP" 
+      class="config-input" 
+      placeholder="e.g., 192.168.1.117"
+    />
+    <p style="font-size: 12px; color: #999; margin: 10px 0;">
+      <strong>Backend IP:</strong> 192.168.1.117<br>
+      <strong>Backend Port:</strong> 5000<br>
+      <strong>Your Device IP:</strong> <span id="yourIP">Detecting...</span>
+    </p>
+    <button class="config-button" onclick="setBackendIP()">Connect to Backend</button>
+  </div>
 </div>
 
+<div class="app">
+
+  <div class="sidebar">
+    <div class="new-chat" onclick="createChat()">＋ New Chat</div>
+    <div class="divider"></div>
+    <div id="chatList" class="chat-list"></div>
+  </div>
+
+  <div class="main">
+    <div class="header">🌱 Agri Assistant</div>
+    <div class="subheader">Smart agricultural guidance for Indian farmers</div>
+
+    <div id="chat" class="chat">
+      <div id="onboarding" class="onboarding">
+        <h2>Your AI guide for crops, weather & schemes</h2>
+        <p>Ask about agriculture to get started</p>
+      </div>
+    </div>
+
+    <div id="voiceOverlay" class="voice-overlay hidden">
+      <div class="waveform" id="waveform"></div>
+      <div class="voice-hint">Listening…</div>
+    </div>
+
+    <div class="input-bar">
+      <input id="input" placeholder="Ask about agriculture..." />
+      <button class="mic"
+        onmousedown="VoiceChat.start()"
+        onmouseup="VoiceChat.stop()"
+        ontouchstart="VoiceChat.start()"
+        ontouchend="VoiceChat.stop()">🎙️</button>
+      <button class="send" onclick="send()">➜</button>
+    </div>
+  </div>
+
+</div>
+
+<div id="contextMenu" class="context-menu hidden">
+  <div onclick="renameChat()">✏️ Rename</div>
+  <div class="danger" onclick="deleteChat()">🗑 Delete</div>
+</div>
+
+<script src="assets/js/audioRecorder.js"></script>
+<script src="assets/js/voiceChat.js"></script>
+
 <script>
-async function askQuestion() {
-    const questionEl = document.getElementById("question");
-    const output = document.getElementById("output");
-    const meta = document.getElementById("meta");
+const chatEl = document.getElementById("chat");
+const listEl = document.getElementById("chatList");
+const input = document.getElementById("input");
+const onboarding = document.getElementById("onboarding");
+const menu = document.getElementById("contextMenu");
 
-    const question = questionEl.value.trim();
+let chats = JSON.parse(localStorage.getItem("chats") || "[]");
+let activeId = localStorage.getItem("activeChat");
+let menuChatId = null;
 
-    if (!question) {
-        output.textContent = "❌ Please enter a question.";
-        meta.textContent = "";
-        return;
+function save() {
+  localStorage.setItem("chats", JSON.stringify(chats));
+  localStorage.setItem("activeChat", activeId);
+}
+
+function updateOnboarding() {
+  const chat = chats.find(c => c.id === activeId);
+  onboarding.style.display = chat && chat.messages.length ? "none" : "block";
+}
+
+function renderSidebar() {
+  listEl.innerHTML = "";
+  chats.forEach(c => {
+    const item = document.createElement("div");
+    item.className = "chat-item" + (c.id === activeId ? " active" : "");
+
+    const title = document.createElement("span");
+    title.className = "chat-title";
+    title.textContent = c.title;
+    title.onclick = () => openChat(c.id);
+
+    const btn = document.createElement("span");
+    btn.className = "menu-btn";
+    btn.textContent = "⋯";
+    btn.onclick = e => {
+      e.stopPropagation();
+      openMenu(e, c.id);
+    };
+
+    item.appendChild(title);
+    item.appendChild(btn);
+    listEl.appendChild(item);
+  });
+}
+
+function addMsg(text, role, saveIt = true) {
+  updateOnboarding();
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg-wrapper " + role;
+
+  const msg = document.createElement("div");
+  msg.className = "msg " + role;
+  msg.innerHTML = text;
+
+  const copy = document.createElement("div");
+  copy.className = "copy-btn";
+  copy.innerHTML = "⧉";
+  copy.onclick = () => navigator.clipboard.writeText(msg.innerText);
+
+  wrap.appendChild(msg);
+  wrap.appendChild(copy);
+  chatEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
+
+  if (saveIt) {
+    chats.find(c => c.id === activeId).messages.push({ role, text });
+    save();
+  }
+}
+
+function createChat() {
+  const id = Date.now().toString();
+  chats.unshift({ id, title: "New Chat", messages: [] });
+  activeId = id;
+  save();
+  renderSidebar();
+  chatEl.innerHTML = "";
+  chatEl.appendChild(onboarding);
+  updateOnboarding();
+}
+
+function openChat(id) {
+  activeId = id;
+  save();
+  renderSidebar();
+  chatEl.innerHTML = "";
+  chatEl.appendChild(onboarding);
+  chats.find(c => c.id === id).messages.forEach(m => addMsg(m.text, m.role, false));
+  updateOnboarding();
+}
+
+function openMenu(e, id) {
+  menuChatId = id;
+  menu.style.top = e.clientY + "px";
+  menu.style.left = e.clientX + "px";
+  menu.classList.remove("hidden");
+}
+
+function renameChat() {
+  const chat = chats.find(c => c.id === menuChatId);
+  const name = prompt("Rename chat:", chat.title);
+  if (name) {
+    chat.title = name;
+    save();
+    renderSidebar();
+  }
+  closeMenu();
+}
+
+function deleteChat() {
+  chats = chats.filter(c => c.id !== menuChatId);
+  activeId = chats[0]?.id || null;
+  save();
+  renderSidebar();
+  chatEl.innerHTML = "";
+  chatEl.appendChild(onboarding);
+  updateOnboarding();
+  closeMenu();
+}
+
+function closeMenu() {
+  menu.classList.add("hidden");
+  menuChatId = null;
+}
+
+document.addEventListener("click", closeMenu);
+
+async function send() {
+  const q = input.value.trim();
+  if (!q) return;
+
+  addMsg(q, "user");
+  input.value = "";
+
+  addMsg("Thinking…", "bot");
+
+  const backend = localStorage.getItem("backend_url");
+
+  const API_BASE_URL = backend
+    ? backend
+    : location.hostname === "localhost"
+    ? "http://127.0.0.1:5000"
+    : "https://onie-unchristened-ernesto.ngrok-free.dev";
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q })
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
     }
 
-    output.innerHTML = "<span class='loading'>⏳ Thinking...</span>";
-    meta.textContent = "";
+    const data = await res.json();
+    chatEl.lastChild.remove();
+    chats.find(c => c.id === activeId).messages.pop();
+    addMsg(marked.parse(data.answer || data.message || "No response."), "bot");
+  } catch (err) {
+    console.error("Error:", err);
+    chatEl.lastChild.remove();
+    chats.find(c => c.id === activeId).messages.pop();
+    addMsg("❌ Error connecting to backend: " + err.message, "bot");
+  }
+}
 
-    try {
-        const response = await fetch("http://127.0.0.1:8000/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question })
-        });
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    send();
+  }
+});
 
-        if (!response.ok) {
-            throw new Error("HTTP error " + response.status);
-        }
+/* ===== BACKEND CONFIGURATION ===== */
+function setBackendIP() {
+  const ipInput = document.getElementById("backendIP").value.trim();
+  
+  if (!ipInput) {
+    alert("Please enter a valid IP address");
+    return;
+  }
+  
+  localStorage.setItem("backend_ip", ipInput);
+  document.getElementById("configModal").classList.add("hidden");
+  location.reload();
+}
 
-        const data = await response.json();
+function checkBackendConfig() {
+  const configModal = document.getElementById("configModal");
+  const backendIP = localStorage.getItem("backend_ip");
+  
+  // Show your own IP
+  document.getElementById("yourIP").textContent = window.location.hostname;
+  
+  if (!backendIP) {
+    configModal.classList.remove("hidden");
+  } else {
+    configModal.classList.add("hidden");
+  }
+}
 
-        // ---------- NO ANSWER ----------
-        if (data.status === "no_answer") {
-            output.innerHTML = `<span class="warning">⚠️ ${data.message}</span>`;
-            meta.textContent = data.suggestion || "";
-            return;
-        }
+// Initialize config check
+checkBackendConfig();
 
-        // ---------- ANSWER (MARKDOWN → HTML) ----------
-        output.innerHTML = marked.parse(data.answer || "");
-
-        meta.innerHTML = `
-            <strong>Confidence:</strong> ${data.confidence.toFixed(2)}<br>
-            <strong>Source:</strong> ${data.diagnostics?.fallback ? "Gemini (fallback)" : "RAG"}<br>
-            <strong>Category:</strong> ${data.diagnostics?.category ?? "general"}
-        `;
-
-    } catch (err) {
-        output.textContent = "❌ Error connecting to backend.";
-        meta.textContent = "";
-        console.error(err);
-    }
+if (chats.length) {
+  activeId = activeId || chats[0].id;
+  renderSidebar();
+  openChat(activeId);
+} else {
+  renderSidebar();
+  updateOnboarding();
 }
 </script>
 
 </body>
 </html>
+

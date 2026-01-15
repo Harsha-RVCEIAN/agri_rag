@@ -1,7 +1,6 @@
 import os
 import time
 from typing import List, Dict, Optional
-from functools import lru_cache
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,15 +22,17 @@ UPSERT_BATCH_SIZE = 100
 
 DEFAULT_NAMESPACE = "agriculture"
 
+# 🔑 Metadata your system REQUIRES downstream
 REQUIRED_METADATA_FIELDS = {
     "chunk_id",
     "content_type",
     "source",
+    "domain",
+    "confidence",
 }
 
 
 # ---------------- GLOBAL SINGLETON ----------------
-# 🔑 Avoid repeated Pinecone init & index checks
 
 _PC = None
 _INDEX = None
@@ -62,7 +63,6 @@ def _get_index():
             )
         )
 
-        # non-busy wait (polite)
         while True:
             status = _PC.describe_index(INDEX_NAME).status
             if status.get("ready"):
@@ -78,17 +78,18 @@ def _get_index():
 class VectorStore:
     """
     Pinecone-backed vector store.
-    Optimized for:
-    - low startup latency
-    - minimal network roundtrips
-    - strict safety guarantees
+
+    Guarantees:
+    - metadata schema enforcement
+    - safe filtering
+    - zero silent corruption
     """
 
     def __init__(self):
         self.index = _get_index()
 
     # -------------------------------------------------
-    # UPSERT (BATCHED, SAFE)
+    # UPSERT (STRICT + BATCHED)
     # -------------------------------------------------
 
     def upsert(
@@ -102,16 +103,32 @@ class VectorStore:
 
         for i in range(0, len(records), UPSERT_BATCH_SIZE):
             batch = records[i:i + UPSERT_BATCH_SIZE]
+            vectors = []
 
-            vectors = [
-                (r["id"], r["vector"], r.get("metadata", {}))
-                for r in batch
+            for r in batch:
+                vid = r.get("id")
+                vec = r.get("vector")
+                meta = r.get("metadata", {})
+
+                # ---------- VECTOR GUARDS ----------
                 if (
-                    r.get("id")
-                    and isinstance(r.get("vector"), list)
-                    and len(r["vector"]) == EMBEDDING_DIM
-                )
-            ]
+                    not vid
+                    or not isinstance(vec, list)
+                    or len(vec) != EMBEDDING_DIM
+                ):
+                    continue
+
+                # ---------- METADATA DEFAULTS ----------
+                meta.setdefault("domain", "general")
+                meta.setdefault("confidence", 0.5)
+                meta.setdefault("language", "unknown")
+                meta.setdefault("content_type", "text")
+
+                # ---------- REQUIRED METADATA ----------
+                if not REQUIRED_METADATA_FIELDS.issubset(meta):
+                    continue
+
+                vectors.append((vid, vec, meta))
 
             if vectors:
                 self.index.upsert(
@@ -120,7 +137,7 @@ class VectorStore:
                 )
 
     # -------------------------------------------------
-    # QUERY (HOT PATH OPTIMIZED)
+    # QUERY (READ PATH)
     # -------------------------------------------------
 
     def query(
@@ -131,11 +148,8 @@ class VectorStore:
         namespace: str = DEFAULT_NAMESPACE
     ) -> List[Dict]:
 
-        # ---- fast reject ----
         if (
             not isinstance(query_vector, list)
-            or not query_vector
-            or not all(isinstance(x, (int, float)) for x in query_vector)
             or len(query_vector) != EMBEDDING_DIM
         ):
             return []

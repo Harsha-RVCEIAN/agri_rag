@@ -2,6 +2,7 @@
 
 import camelot
 import hashlib
+import os
 from typing import List, Dict
 
 # ---------------- CONFIG ----------------
@@ -96,6 +97,10 @@ def extract_tables_from_pdf(
 
             row_values = [_clean_cell(v) for v in row]
 
+            # ---------- 🔑 SKIP REPEATED HEADER ROW ----------
+            if [v.lower() for v in row_values] == [h.lower() for h in headers]:
+                continue
+
             # ---------- EMPTY / JUNK ROW ----------
             if not any(row_values):
                 continue
@@ -132,7 +137,10 @@ def extract_tables_from_pdf(
                     "chunk_id": chunk_id,
                     "doc_id": doc_id,
                     "page": page_number,
-                    "source": page_meta.get("source"),
+                    "source": (
+                        os.path.basename(page_meta.get("source"))
+                        if page_meta.get("source") else None
+                    ),
                     "content_type": "table_row",
                     "table_index": table_index,
                     "row_index": row_index,
@@ -145,7 +153,7 @@ def extract_tables_from_pdf(
                     "extraction_method": "camelot",
                     "source_type": page_meta.get("source_type", "pdf"),
                     "language": page_meta.get("language", "unknown"),
-                    "confidence": min(page_meta.get("confidence", 1.0), 0.85),  # 🔑 table ≠ perfect
+                    "confidence": min(page_meta.get("confidence", 1.0), 0.85),
                     "priority": 5,
                 }
             })

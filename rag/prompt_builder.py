@@ -1,13 +1,15 @@
 from typing import List, Dict
 
-# ---------------- CONFIG ----------------
+# =========================================================
+# CONFIG
+# =========================================================
 
 # NORMAL MODE (RAG)
 MAX_CONTEXT_CHUNKS = 6
 MAX_CONTEXT_CHARS = 6000
-MAX_CHARS_PER_CHUNK = 900   # 🔥 MOST IMPORTANT FIX
+MAX_CHARS_PER_CHUNK = 900   # 🔑 hard per-chunk cap
 
-# FAST MODE (definition / policy)
+# FAST MODE (definitions / policies)
 FAST_MAX_CHUNKS = 2
 FAST_MAX_CHARS = 2200
 FAST_MAX_CHARS_PER_CHUNK = 700
@@ -18,25 +20,29 @@ class PromptBuilder:
     Formatting-only component.
 
     Responsibilities:
-    - Context selection
-    - Context trimming
-    - Prompt safety
+    - Context selection (NO re-ranking)
+    - Context trimming (hard caps)
+    - Prompt safety (anti-hallucination)
 
-    NO confidence logic
-    NO refusal logic
+    Explicitly does NOT:
+    - Score chunks
+    - Decide relevance
+    - Handle refusals
     """
 
-    # ---------------- MAIN ----------------
+    # =====================================================
+    # MAIN
+    # =====================================================
 
     def build(
         self,
         query: str,
         retrieved_chunks: List[Dict],
-        fast_mode: bool = False,   # 🔥 PIPELINE SHOULD PASS THIS
+        fast_mode: bool = False,
     ) -> Dict:
 
-        used = []
-        seen = set()
+        used: List[Dict] = []
+        seen_ids = set()
         total_chars = 0
 
         if fast_mode:
@@ -48,16 +54,18 @@ class PromptBuilder:
             max_chars = MAX_CONTEXT_CHARS
             max_per_chunk = MAX_CHARS_PER_CHUNK
 
+        # -------------------------------------------------
+        # CONTEXT SELECTION (ORDER PRESERVED)
+        # -------------------------------------------------
         for c in retrieved_chunks:
             cid = c.get("chunk_id")
-            if not cid or cid in seen:
+            if not cid or cid in seen_ids:
                 continue
 
             raw_text = (c.get("text") or "").strip()
             if not raw_text:
                 continue
 
-            # 🔥 HARD TRIM PER CHUNK
             text = raw_text[:max_per_chunk]
             text_len = len(text)
 
@@ -67,12 +75,33 @@ class PromptBuilder:
             c_copy = dict(c)
             c_copy["text"] = text
 
-            seen.add(cid)
+            seen_ids.add(cid)
             used.append(c_copy)
             total_chars += text_len
 
             if len(used) >= max_chunks:
                 break
+
+        # -------------------------------------------------
+        # EMPTY CONTEXT GUARD (CRITICAL)
+        # -------------------------------------------------
+        if not used:
+            return {
+                "system_prompt": self._system_prompt(),
+                "user_prompt": (
+                    "CONTEXT:\n\n"
+                    "QUESTION:\n"
+                    f"{query}\n\n"
+                    "ANSWER:\n"
+                    "Not found in the provided documents."
+                ),
+                "used_chunks": [],
+                "stats": {
+                    "chunks_used": 0,
+                    "context_chars": 0,
+                    "fast_mode": fast_mode,
+                },
+            }
 
         context = self._format_context(used)
 
@@ -87,7 +116,9 @@ class PromptBuilder:
             },
         }
 
-    # ---------------- PROMPTS ----------------
+    # =====================================================
+    # PROMPTS
+    # =====================================================
 
     def _system_prompt(self) -> str:
         return (
@@ -100,6 +131,9 @@ class PromptBuilder:
             "   'Not found in the provided documents.'\n"
             "5. Use tables for numeric answers when available.\n"
             "6. Be precise and concise.\n"
+            "7. Never stop at mid-sentence or mid-thought.\n"
+            "8. if it is extending token limit , then pick till its previous sentence and display it. \n"
+            "9. 'Not found in the provided documents.'\n"
         )
 
     def _user_prompt(self, query: str, context: str) -> str:
@@ -111,10 +145,12 @@ class PromptBuilder:
             "ANSWER:"
         )
 
-    # ---------------- CONTEXT FORMAT ----------------
+    # =====================================================
+    # CONTEXT FORMAT
+    # =====================================================
 
     def _format_context(self, chunks: List[Dict]) -> str:
-        formatted = []
+        formatted: List[str] = []
 
         for i, c in enumerate(chunks, start=1):
             header = []

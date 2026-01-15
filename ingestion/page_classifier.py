@@ -1,12 +1,16 @@
 import re
-from typing import Dict
+from typing import Dict, Optional
 
-# ---------------- CONFIG THRESHOLDS ----------------
+
+# =========================================================
+# CONFIG THRESHOLDS (DEFAULTS)
+# =========================================================
 
 MIN_TEXT_LENGTH = 40
 MIN_ALPHA_RATIO = 0.35
 MAX_HEADER_REPEAT_SCORE = 0.6
-MIN_IMAGE_COUNT_FOR_OCR = 1
+
+MIN_IMAGE_COUNT_FOR_OCR = 2   # 🔑 avoid logo-triggered OCR
 
 MIN_MEANINGFUL_WORDS = 6
 MAX_DIGIT_RATIO = 0.4
@@ -15,7 +19,9 @@ MAX_DIGIT_RATIO = 0.4
 TABLE_UNIT_HINTS = r"\b(kg|g|quintal|ha|acre|%|rs|₹)\b"
 
 
-# ---------------- HELPER FUNCTIONS ----------------
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
 
 def _alphanumeric_ratio(text: str) -> float:
     if not text:
@@ -58,7 +64,7 @@ def _looks_like_header_or_footer(text: str, repeat_score: float) -> bool:
         r"\bभारत सरकार\b",
         r"\bgovt\.?\b",
         r"\bwww\.",
-        r"\bhttp[s]?://"
+        r"\bhttp[s]?://",
     ]
     if any(re.search(p, t_lower) for p in boilerplate_patterns) and len(t) < 150:
         return True
@@ -102,19 +108,46 @@ def _looks_like_table(text: str) -> bool:
     return numeric_lines >= max(2, len(lines) // 3)
 
 
-# ---------------- MAIN CLASSIFIER ----------------
+# =========================================================
+# MAIN CLASSIFIER
+# =========================================================
 
-def classify_page(page: Dict) -> str:
+def classify_page(
+    page: Dict,
+    doc_rules: Optional[Dict] = None
+) -> str:
     """
     Conservative page classifier.
 
     Returns:
-    - TEXT_OK        (usable text layer)
-    - OCR_REQUIRED   (image / junk / weak semantic text)
+    - TEXT_OK
+    - OCR_REQUIRED
+
+    doc_rules allows SAFE overrides per document class.
     """
+
+    doc_rules = doc_rules or {}
+    domain = doc_rules.get("domain")
 
     text = page.get("text", "").strip()
     repeat_score = page.get("header_repeat_score", 0.0)
+
+    # =====================================================
+    # 🔑 DOMAIN OVERRIDES (STRICT & LIMITED)
+    # =====================================================
+
+    # Statistics / reports → NEVER OCR
+    if domain in {"statistics", "market"}:
+        return "TEXT_OK" if text else "OCR_REQUIRED"
+
+    # Schemes → text preferred, OCR discouraged
+    if domain == "scheme":
+        if text and _meaningful_word_count(text) >= 4:
+            return "TEXT_OK"
+
+    # =====================================================
+    # DEFAULT CLASSIFICATION LOGIC
+    # =====================================================
 
     # ---------- no text layer ----------
     if not text:
@@ -133,7 +166,6 @@ def classify_page(page: Dict) -> str:
         return "OCR_REQUIRED"
 
     # ---------- numeric-heavy ----------
-    # allow tables, reject unstructured numeric noise
     if _digit_ratio(text) > MAX_DIGIT_RATIO and not _looks_like_table(text):
         return "OCR_REQUIRED"
 

@@ -1,24 +1,27 @@
-# ingestion/chunker.py
-
 from typing import List, Dict
 import re
 import hashlib
 
 
-# ---------- CONFIG ----------
+# =========================================================
+# CONFIG
+# =========================================================
+
 MAX_TOKENS_SOFT = 300
 MIN_CHARS = 40
 OCR_MAX_CHARS = 220   # slightly higher to preserve meaning
 
 
-# ---------- UTILS ----------
+# =========================================================
+# UTILS
+# =========================================================
+
 def _approx_token_count(text: str) -> int:
     return max(1, len(text) // 4)
 
 
 def _normalize_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _stable_chunk_id(doc_id: str, page: int, section: str, index: int) -> str:
@@ -26,24 +29,31 @@ def _stable_chunk_id(doc_id: str, page: int, section: str, index: int) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-# ---------- SEMANTIC SPLITTERS ----------
+# =========================================================
+# SEMANTIC SPLITTERS
+# =========================================================
+# 🔑 Minimal but powerful — do NOT add more pivots
+
 LOGICAL_PIVOTS = [
     "however",
     "except",
     "provided that",
     "note:",
     "important:",
+    "eligibility",
+    "procedure",
 ]
 
 
 def _split_logical_units(text: str) -> List[str]:
     """
     Split text so that logical pivots START new chunks.
+    Conservative to avoid over-fragmentation.
     """
-    pattern = r"(?i)\b(" + "|".join(LOGICAL_PIVOTS) + r")\b"
+    pattern = r"(?i)\b(" + "|".join(map(re.escape, LOGICAL_PIVOTS)) + r")\b"
     parts = re.split(pattern, text)
 
-    units = []
+    units: List[str] = []
     buffer = ""
 
     for part in parts:
@@ -70,22 +80,24 @@ def _split_paragraphs(text: str) -> List[str]:
     return [p.strip() for p in paras if len(p.strip()) >= MIN_CHARS]
 
 
-# ---------- MAIN CHUNKER ----------
+# =========================================================
+# MAIN CHUNKER
+# =========================================================
+
 def chunk_page(page: Dict) -> List[Dict]:
     """
     Meaning-first chunker.
     Produces stable, relevance-friendly chunks.
+
+    IMPORTANT:
+    - Used ONLY for Class A (crop production)
+    - Other classes bypass this
     """
 
     text = _normalize_text(page["content"])
     content_type = page["content_type"]
 
-    doc_id = page["doc_id"]
-    page_no = page["page_number"]
-
-    # Better section inference
     section = page.get("section") or content_type
-
     units: List[str] = []
 
     # ---------- PROCEDURE ----------
@@ -95,14 +107,11 @@ def chunk_page(page: Dict) -> List[Dict]:
     # ---------- OCR ----------
     elif content_type == "ocr":
         paras = _split_paragraphs(text)
-        units = []
         for p in paras:
             if len(p) <= OCR_MAX_CHARS:
                 units.append(p)
             else:
-                units.extend(
-                    re.split(r"(?<=[.!?])\s+", p)
-                )
+                units.extend(re.split(r"(?<=[.!?])\s+", p))
 
     # ---------- NORMAL TEXT ----------
     else:
@@ -134,7 +143,10 @@ def chunk_page(page: Dict) -> List[Dict]:
     return chunks
 
 
-# ---------- CHUNK BUILDER ----------
+# =========================================================
+# CHUNK BUILDER
+# =========================================================
+
 def _build_chunk(text: str, page: Dict, section: str, index: int) -> Dict:
     chunk_id = _stable_chunk_id(
         page["doc_id"],
@@ -154,7 +166,7 @@ def _build_chunk(text: str, page: Dict, section: str, index: int) -> Dict:
             "content_type": page["content_type"],
             "language": page["language"],
             "confidence": page.get("confidence", 1.0),
-            "priority": _priority_from_type(page["content_type"])
+            "priority": _priority_from_type(page["content_type"]),
         }
     }
 
@@ -165,5 +177,5 @@ def _priority_from_type(content_type: str) -> int:
         "table": 5,
         "table_row": 5,
         "text": 4,
-        "ocr": 2
+        "ocr": 2,
     }.get(content_type, 3)

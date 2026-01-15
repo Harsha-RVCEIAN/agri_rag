@@ -11,6 +11,7 @@ from transformers import pipeline
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 
 
 # ============================================================
@@ -22,13 +23,38 @@ _LOCAL_TOKENIZER = None
 _GEMINI_CLIENT = None
 
 
+# ============================================================
+# HARD LIMITS (DO NOT CHANGE LIGHTLY)
+# ============================================================
+
+GEMINI_FALLBACK_MAX_TOKENS = 200     # 🔒 fixed size per call
+GEMINI_DEFINITION_MAX_TOKENS = 300
+GEMINI_MAX_TURNS = 1                # 🔒 IMPORTANT: prevents quota burn
+
+
+# ============================================================
+# CORE SYSTEM INSTRUCTION (GENERIC + SAFE)
+# ============================================================
+
+CORE_SYSTEM_PROMPT = (
+    "SYSTEM ROLE: Agricultural Information Assistant.\n\n"
+    "RULES:\n"
+    "1. Answer clearly and concisely.\n"
+    "2. Provide a short and complete summary donot give half answers,  not long explanations.\n"
+    "3. If listing points, include all key points briefly.\n"
+    "4. Do NOT repeat ideas or add filler text.\n"
+    "5. Stop when the answer is logically complete.\n"
+    "6. Never stop at mid-sentence or mid-thought.\n"
+    "7. if it is extending token limit , then pick till its previous sentence and display it. \n"
+)
+
+
 class LLMClient:
     """
     Unified LLM client with strict role separation.
 
     LOCAL (FLAN-T5):
         - RAG answers ONLY
-        - Deterministic, grounded
 
     GEMINI:
         - Definitions
@@ -40,8 +66,8 @@ class LLMClient:
         self,
         local_model: str = "google/flan-t5-base",
         max_input_tokens: int = 1024,
-        max_output_tokens: int = 4096,   # 🔥 increased (fixes short UI answers)
-        provider: str = "local",        # "local" | "gemini"
+        max_output_tokens: int = 4096,
+        provider: str = "local",
     ):
         self.provider = provider
         self.max_input_tokens = max_input_tokens
@@ -99,16 +125,12 @@ class LLMClient:
         sentences = re.split(r"(?<=[.!?])\s+", text)
         seen = set()
         clean = []
-
         for s in sentences:
-            key = s.strip().lower()
-            if len(key) < 8:
+            k = s.strip().lower()
+            if len(k) < 8 or k in seen:
                 continue
-            if key in seen:
-                continue
-            seen.add(key)
+            seen.add(k)
             clean.append(s.strip())
-
         return " ".join(clean)
 
     # ============================================================
@@ -122,27 +144,18 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
     ) -> str:
-        """
-        Generate text using selected provider.
-
-        🔴 RULE:
-        - NEVER silently return empty string
-        - Fail loudly in logs, softly in output
-        """
 
         # ================= LOCAL (FLAN-T5) =================
         if self.provider == "local":
             try:
                 prompt = (
-                    "Answer strictly using the provided context.\n"
-                    "Do not repeat sentences.\n\n"
-                    f"{system_prompt}\n\n"
-                    f"{user_prompt}"
+                    "Answer strictly using the provided context.\n\n"
+                    f"{system_prompt}\n\n{user_prompt}"
                 )
 
                 prompt = self._truncate(prompt)
 
-                output = self.pipe(
+                out = self.pipe(
                     prompt,
                     max_new_tokens=min(
                         max_tokens or self.max_output_tokens,
@@ -153,9 +166,7 @@ class LLMClient:
                     repetition_penalty=1.25,
                 )
 
-                text = output[0]["generated_text"].strip()
-                text = self._dedupe_repetition(text)
-
+                text = self._dedupe_repetition(out[0]["generated_text"].strip())
                 return text or "Answer could not be generated from the documents."
 
             except Exception:
@@ -165,26 +176,42 @@ class LLMClient:
         # ================= GEMINI =================
         if self.provider == "gemini":
             try:
+                token_cap = max_tokens or GEMINI_FALLBACK_MAX_TOKENS
+
                 response = self.gemini_client.models.generate_content(
-                    model="models/gemini-flash-latest",  # ✅ FREE-TIER SAFE
-                    contents=f"{system_prompt}\n\n{user_prompt}",
+                    model="models/gemini-flash-latest",
+                    contents=(
+                        CORE_SYSTEM_PROMPT
+                        + "\n\n"
+                        + system_prompt
+                        + "\n\n"
+                        + user_prompt
+                    ),
                     config=types.GenerateContentConfig(
                         temperature=temperature,
-                        max_output_tokens=max_tokens or self.max_output_tokens,
+                        max_output_tokens=token_cap,
                     ),
                 )
 
                 text = (response.text or "").strip()
+                text = self._dedupe_repetition(text)
 
-                # 🔥 IMPORTANT: DO NOT DROP SHORT ANSWERS
-                if not text:
-                    logging.error("❌ Gemini returned empty response")
-                    return "Definition not available at the moment."
+                return text or "Answer not available at the moment."
 
-                return text
+            except ClientError as e:
+                # 🔒 QUOTA / RATE LIMIT HANDLING
+                if "RESOURCE_EXHAUSTED" in str(e):
+                    logging.warning("⚠️ Gemini quota exhausted — fallback suppressed")
+                    return (
+                        "I’m temporarily unable to fetch additional information. "
+                        "Please try again later or rely on available documents."
+                    )
 
-            except Exception as e:
-                logging.exception(f"❌ Gemini failed: {e}")
-                return "Definition service is temporarily unavailable."
+                logging.exception("❌ Gemini client error")
+                return "Answer service is temporarily unavailable."
+
+            except Exception:
+                logging.exception("❌ Gemini failed")
+                return "Answer service is temporarily unavailable."
 
         return "Unable to generate answer."

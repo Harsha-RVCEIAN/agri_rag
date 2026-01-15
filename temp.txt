@@ -1,0 +1,525 @@
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env", override=True)
+
+import os
+import sys
+import shutil
+import hashlib
+import re
+from typing import Optional, Dict
+from functools import lru_cache
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from fastapi.responses import Response
+
+# ---------------- PATH SETUP ----------------
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# ---------------- INTERNAL IMPORTS ----------------
+
+from rag.pipeline import RAGPipeline
+from llm.llm_client import LLMClient
+from ingestion.pipeline import ingest_pdf
+from embeddings.embedder import Embedder
+from embeddings.vector_store import VectorStore
+
+from nlp.language_detector import detect_language
+from nlp.translator import Translator
+from nlp.query_normalizer import normalize_query
+from nlp.glossary import apply_glossary
+
+from speech.stt import transcribe_audio
+from speech.tts import synthesize_speech
+from speech.confidence import (
+    validate_stt_result,
+    validate_answer_for_voice,
+)
+
+# ---------------- APP INIT ----------------
+
+app = FastAPI(
+    title="Agri-RAG API",
+    description="Evidence-bound agricultural QA system (Text + Voice)",
+    version="3.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------- STORAGE ----------------
+
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+PDF_DIR = os.path.join(DATA_DIR, "pdfs")
+STATE_FILE = os.path.join(DATA_DIR, "vector_store", "index_state.json")
+
+os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+
+# ---------------- STATE UTILS ----------------
+
+def _file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _load_state() -> Dict[str, str]:
+    if not os.path.exists(STATE_FILE):
+        return {}
+    import json
+    with open(STATE_FILE, "r") as f:
+        return json.load(f)
+
+def _save_state(state: Dict[str, str]) -> None:
+    import json
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+# ---------------- STARTUP ----------------
+
+@app.on_event("startup")
+def startup_event():
+    embedder = Embedder()
+    vector_store = VectorStore()
+
+    app.state.embedder = embedder
+    app.state.vector_store = vector_store
+    app.state.rag = RAGPipeline(
+        vector_store=vector_store,
+        embedder=embedder
+    )
+
+    app.state.gemini_llm = LLMClient(provider="gemini")
+    app.state.translator = Translator(provider="gemini")
+
+    print("✅ Agri-RAG API ready (Text + Voice)")
+
+# ---------------- DOMAIN GUARDS ----------------
+
+AGRI_KEYWORDS = {
+     # core short prompt-style terms
+    "agri","agriculture","agro","agronomy","farm","farming","farmer","farm_ops",
+    "farm_sys","farm_mgmt","agri_mgmt","agri_sys","agri_data","agri_ai","agri_ml",
+    "agri_tech","agritech","smart_agri","digital_agri","precision_agri",
+
+    # land & soil
+    "soil","soil_health","soil_mgmt","soil_test","soil_fertility","soil_ph",
+    "soil_carbon","soil_water","soil_type","topsoil","subsoil","loam","clay",
+    "sand","silt","humus","organic_matter","soil_ecology","soil_microbes",
+    "soil_structure","soil_profile","soil_salinity","soil_erosion",
+
+    # water & irrigation
+    "water","irrigation","irrig_sys","irrig_mgmt","drip_irrig","sprinkler",
+    "flood_irrig","canal_irrig","rainfed","rainwater","water_cycle",
+    "water_use","water_efficiency","water_stress","groundwater",
+    "surface_water","watershed","drainage","mulch","mulching",
+
+    # land preparation
+    "tillage","plough","plowing","harrow","cultivator","rotavator",
+    "land_prep","seedbed","bed_prep","zero_till","no_till",
+    "min_till","conservation_till",
+
+    # crops (grains)
+    "crop","crops","crop_sys","crop_cycle","crop_yield","yield",
+    "rice","wheat","maize","corn","barley","oats","rye",
+    "millet","sorghum","quinoa","triticale",
+
+    # pulses & legumes
+    "pulse","pulses","legume","soybean","soy","groundnut","peanut",
+    "chickpea","lentil","pigeonpea","cowpea","mungbean","blackgram",
+    "fieldpea","drybean",
+
+    # oilseeds
+    "oilseed","mustard","canola","sunflower","sesame",
+    "linseed","safflower","castor","nigerseed",
+
+    # tubers & roots
+    "tuber","root_crop","potato","sweetpotato","cassava",
+    "yam","taro","beetroot","radish","carrot",
+
+    # vegetables
+    "veg","vegetable","tomato","onion","garlic","chili",
+    "capsicum","brinjal","eggplant","okra","cucumber",
+    "pumpkin","gourd","bittergourd","bottlegourd",
+    "zucchini","spinach","lettuce","cabbage","cauliflower",
+    "broccoli","kale",
+
+    # fruits
+    "fruit","orchard","horticulture","mango","banana",
+    "apple","grape","orange","lemon","lime","guava",
+    "papaya","pineapple","watermelon","muskmelon",
+    "pear","peach","plum","pomegranate","fig",
+    "date","coconut","arecanut","cashew","almond",
+    "walnut","pistachio",
+
+    # seeds & planting
+    "seed","seedling","nursery","planting","sowing",
+    "broadcast","transplant","direct_seed","seed_rate",
+    "seed_treat","seed_quality","hybrid_seed",
+    "op_seed","germination","viability","seed_bank",
+
+    # nutrients & fertilizers
+    "nutrient","plant_nutrition","fertilizer","fert",
+    "chemical_fert","organic_fert","biofert",
+    "npk","nitrogen","phosphorus","potassium",
+    "urea","dap","mop","ssp","micronutrient",
+    "zinc","iron","boron","copper","manganese",
+    "sulphur","manure","fym","compost",
+    "vermicompost","green_manure",
+
+    # pests
+    "pest","pests","insect","insects","aphid","whitefly",
+    "thrips","bollworm","stem_borer","leaf_folder",
+    "armyworm","cutworm","mite","nematode",
+    "rodent","bird_damage",
+
+    # diseases
+    "disease","plant_disease","fungal_disease",
+    "bacterial_disease","viral_disease",
+    "blight","rust","smut","wilt",
+    "powdery_mildew","downy_mildew",
+    "leaf_spot","root_rot","stem_rot",
+    "anthracnose","mosaic_virus",
+
+    # weeds
+    "weed","weeds","weed_mgmt","weeding",
+    "manual_weeding","mechanical_weeding",
+    "chemical_weeding","herbicide",
+    "pre_emergence","post_emergence",
+    "glyphosate","atrazine","pendimethalin","two_four_d",
+
+    # protection
+    "pesticide","insecticide","fungicide",
+    "spray","sprayer","knapsack_sprayer",
+    "power_sprayer","dose","resistance",
+    "ipm","integrated_pest_mgmt",
+    "biocontrol","biopesticide",
+    "pheromone_trap",
+
+    # climate
+    "climate","weather","climate_change",
+    "rainfall","temperature","humidity",
+    "drought","flood","heat_stress",
+    "cold_stress","frost","hailstorm",
+
+    # technology
+    "precision_farming","smart_farming",
+    "remote_sensing","satellite_data",
+    "gis","gps","drone","agri_drone",
+    "yield_map","variable_rate",
+    "decision_support","farm_analytics",
+    "iot_agri","sensor","soil_sensor",
+    "weather_station",
+
+    # machinery
+    "mechanization","tractor","plough_tool",
+    "seed_drill","planter","reaper",
+    "harvester","combine","thresher",
+    "baler","irrig_pump","diesel_pump",
+    "electric_pump",
+
+    # livestock
+    "livestock","animal_husbandry","dairy",
+    "milk","cow","buffalo","goat","sheep",
+    "pig","poultry","chicken","duck",
+    "feed","fodder","silage","hay",
+    "breeding","ai_breeding",
+    "veterinary","animal_health",
+
+    # systems & sustainability
+    "organic_farming","natural_farming",
+    "zbnf","sustainable_agri",
+    "regenerative_agri","agroecology",
+    "agroforestry","permaculture",
+    "mixed_farming","crop_rotation",
+    "intercropping","monocrop",
+    "cover_crop",
+
+    # protected cultivation
+    "greenhouse","polyhouse","shade_net",
+    "protected_cultivation",
+    "hydroponics","aeroponics",
+    "aquaponics","vertical_farming",
+
+    # post-harvest
+    "post_harvest","storage","cold_storage",
+    "warehouse","grading","sorting",
+    "packaging","processing","value_add",
+    "shelf_life","food_loss","food_waste",
+
+    # economics & policy
+    "agri_economics","farm_economics",
+    "cost_of_cultivation","input_cost",
+    "output_price","market","mandi",
+    "auction","msp","minimum_support_price",
+    "supply_chain","logistics","export",
+    "import","agribusiness",
+
+    # farmer & institutions
+    "farmer","smallholder","marginal_farmer",
+    "tenant_farmer","fpo","cooperative",
+    "extension","agri_extension",
+    "training","capacity_building",
+
+    # food system
+    "food_security","nutrition","food_system",
+    "food_chain","food_processing",
+    "food_safety","quality_control",
+    "traceability","certification",
+
+    # research & biotech
+    "agri_research","plant_breeding",
+    "genetics","genomics","hybridization",
+    "mutation_breeding","biotech",
+    "gm_crop","crispr","tissue_culture",
+    "micropropagation"
+}
+
+PERSON_PATTERNS = (r"\bwho is\b", r"\bbiography\b", r"\bborn\b", r"\bage\b", r"\bnet worth\b")
+DEFINITION_TRIGGERS = ("what is", "define", "definition of", "meaning of", "explain")
+
+def looks_like_person_query(q: str) -> bool:
+    return any(re.search(p, q.lower()) for p in PERSON_PATTERNS)
+
+def is_definition_query(q: str) -> bool:
+    q = q.lower().strip()
+    return any(q.startswith(t) for t in DEFINITION_TRIGGERS)
+
+# ---------------- RAG CACHE ----------------
+
+@lru_cache(maxsize=512)
+def cached_rag_answer(
+    question: str,
+    intent: Optional[str],
+    language: Optional[str],
+    category: Optional[str],
+) -> Dict:
+    return app.state.rag.run(
+        query=question,
+        intent=intent,
+        language=language,
+        category=category,
+    )
+
+# ---------------- SCHEMAS ----------------
+
+class ChatRequest(BaseModel):
+    question: str
+    intent: Optional[str] = None
+    language: Optional[str] = None
+    category: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    status: str
+    answer: Optional[str]
+    confidence: float
+    message: Optional[str] = None
+    suggestion: Optional[str] = None
+    diagnostics: Optional[Dict] = None
+
+# ---------------- ROUTES ----------------
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+# ============================================================
+# TEXT CHAT (UNCHANGED)
+# ============================================================
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    raw = req.question.strip()
+    if not raw:
+        raise HTTPException(400, "Empty question")
+
+    lang_info = detect_language(raw)
+    translation_in = app.state.translator.to_english(raw, lang_info)
+
+    if not translation_in["success"]:
+        return ChatResponse(
+            status="no_answer",
+            answer=None,
+            confidence=0.0,
+            message="Unable to understand the question language.",
+        )
+
+    english_query = apply_glossary(translation_in["text"])
+    norm = normalize_query(english_query)
+
+    if not norm["is_agriculture_related"]:
+        return ChatResponse(
+            status="no_answer",
+            answer=None,
+            confidence=0.0,
+            message="This system answers agriculture-related questions only.",
+        )
+
+    normalized_query = norm["normalized_query"]
+
+    result = cached_rag_answer(
+        normalized_query,
+        req.intent,
+        "en",
+        req.category,
+    )
+
+    if result.get("status") == "answer":
+        translation_out = app.state.translator.from_english(
+            result["answer"],
+            lang_info
+        )
+
+        final_answer = (
+            translation_out["text"]
+            if translation_out["success"]
+            else result["answer"]
+        )
+
+        return ChatResponse(
+            status="answer",
+            answer=final_answer,
+            confidence=result["confidence"],
+            diagnostics=result.get("diagnostics"),
+        )
+
+    return ChatResponse(
+        status="no_answer",
+        answer=None,
+        confidence=0.0,
+        message=result.get("message"),
+        suggestion=result.get("suggestion"),
+    )
+
+# ============================================================
+# VOICE CHAT (NEW)
+# ============================================================
+
+@app.post("/chat/voice")
+def chat_voice(file: UploadFile = File(...)):
+
+    audio_bytes = file.file.read()
+
+    # -------- STT --------
+    stt_result = transcribe_audio(audio_bytes, file.filename)
+    stt_check = validate_stt_result(stt_result)
+
+    if not stt_check["is_valid"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Speech not clear: {stt_check['reason']}"
+        )
+
+    text_query = stt_result["text"]
+
+    # -------- NLP --------
+    lang_info = detect_language(text_query)
+    translation_in = app.state.translator.to_english(text_query, lang_info)
+
+    if not translation_in["success"]:
+        raise HTTPException(400, "Unable to translate speech reliably")
+
+    english_query = apply_glossary(translation_in["text"])
+    norm = normalize_query(english_query)
+
+    if not norm["is_agriculture_related"]:
+        raise HTTPException(400, "Voice queries must be agriculture-related")
+
+    # -------- RAG --------
+    result = cached_rag_answer(
+        norm["normalized_query"],
+        None,
+        "en",
+        None,
+    )
+
+    if result.get("status") != "answer":
+        return {
+            "status": "no_answer",
+            "text": None,
+            "confidence": 0.0,
+            "message": result.get("message"),
+        }
+
+    answer_en = result["answer"]
+    confidence = result["confidence"]
+
+    translation_out = app.state.translator.from_english(
+        answer_en,
+        lang_info
+    )
+
+    final_text = (
+        translation_out["text"]
+        if translation_out["success"]
+        else answer_en
+    )
+
+    # -------- VOICE CONFIDENCE --------
+    voice_ok = validate_answer_for_voice(final_text, confidence)
+
+    if not voice_ok["is_valid"]:
+        return {
+            "status": "answer",
+            "text": final_text,
+            "confidence": confidence,
+            "audio": None,
+            "note": voice_ok["reason"],
+        }
+
+    # -------- TTS --------
+    tts = synthesize_speech(
+        final_text,
+        lang_info.get("language", "en"),
+    )
+
+    if not tts["success"]:
+        raise HTTPException(500, "TTS generation failed")
+
+    return Response(
+        content=tts["audio_bytes"],
+        media_type=tts["mime_type"],
+        headers={
+            "X-Answer-Text": final_text,
+            "X-Confidence": str(confidence),
+        }
+    )
+
+# ---------------- PDF UPLOAD ----------------
+
+@app.post("/upload-pdf")
+def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files allowed")
+
+    path = os.path.join(PDF_DIR, file.filename)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    background_tasks.add_task(ingest_pdf_background, path)
+    return {"status": "accepted", "file": file.filename}
+
+def ingest_pdf_background(pdf_path: str):
+    state = _load_state()
+    h = _file_hash(pdf_path)
+
+    if state.get(pdf_path) == h:
+        return
+
+    chunks = ingest_pdf(pdf_path)
+    records = app.state.embedder.embed_chunks(chunks)
+    app.state.vector_store.upsert(records)
+
+    state[pdf_path] = h
+    _save_state(state)

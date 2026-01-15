@@ -5,9 +5,11 @@ from rag.prompt_builder import PromptBuilder
 from rag.answer_generator import AnswerGenerator
 
 
-# ---------------- GLOBAL THRESHOLDS ----------------
+# =========================================================
+# GLOBAL THRESHOLDS
+# =========================================================
 
-FINAL_CONFIDENCE_THRESHOLD = 0.5
+FINAL_CONFIDENCE_THRESHOLD = 0.35
 
 CATEGORY_CONFIDENCE_CAPS = {
     "policy": 1.0,
@@ -20,10 +22,24 @@ MANDATORY_TEXT_DOMINANCE = {"policy", "market"}
 OCR_FORBIDDEN_CATEGORIES = {"policy", "disease"}
 TABLE_REQUIRED_CATEGORIES = {"market"}
 
-FAST_CATEGORIES = {"policy"}  # definition is NOT RAG
+FAST_CATEGORIES = {"policy"}  # definition / lookup ≠ full RAG
 
 
-# ---------------- USER-FACING FALLBACK MESSAGES ----------------
+# =========================================================
+# CATEGORY → DOMAIN MAP
+# =========================================================
+
+CATEGORY_DOMAIN_MAP = {
+    "policy": "scheme",
+    "market": "market",
+    "advisory": "crop_production",
+    "disease": "crop_disease",
+}
+
+
+# =========================================================
+# USER-FACING FALLBACK MESSAGES
+# =========================================================
 
 NO_ANSWER_MESSAGES = {
     "retrieval_failed": {
@@ -39,8 +55,8 @@ NO_ANSWER_MESSAGES = {
         "suggestion": "Please check the document quality or ask about a different section."
     },
     "low_final_confidence": {
-        "message": "I found some information, but it is not reliable enough to give a confident answer.",
-        "suggestion": "Try narrowing your question or providing a more specific document."
+        "message": "I found relevant information, but it is not reliable enough to answer confidently.",
+        "suggestion": "Try narrowing your question or consult official sources."
     },
     "category_violation": {
         "message": "This question requires stricter evidence than what is available.",
@@ -60,7 +76,9 @@ class RAGPipeline:
         self.prompt_builder = PromptBuilder()
         self.answer_generator = AnswerGenerator()
 
-    # ---------------- MAIN ----------------
+    # =====================================================
+    # MAIN
+    # =====================================================
 
     def run(
         self,
@@ -71,61 +89,99 @@ class RAGPipeline:
     ) -> Dict:
 
         category = category or "policy"
+        domain = CATEGORY_DOMAIN_MAP.get(category)
         fast_mode = category in FAST_CATEGORIES
 
-        # ---------------- RETRIEVAL ----------------
-        # ✅ FIXED: always returns List[List[float]]
-        query_vectors = self.embedder.embed_texts([query])  # List[List[float]]
+        # -------------------------------------------------
+        # RETRIEVAL
+        # -------------------------------------------------
+        query_vectors = self.embedder.embed_texts([query])
 
         retrieval = self.retriever.retrieve(
-            query=query,
             query_vectors=query_vectors,
             intent=intent,
-            language=language
+            language=language,
+            domain=domain,
         )
 
         retrieval_diag = retrieval.get("diagnostics", {})
         diagnostics = {
             "category": category,
+            "domain": domain,
+            "fast_mode": fast_mode,
             "retrieval": retrieval_diag,
         }
 
-        # ---------- HARD FAIL ----------
+        # ---------- HARD FAIL (NO DATA) ----------
         if retrieval_diag.get("status") != "ok":
-            return self._fallback("retrieval_failed", diagnostics)
+            return self._fallback(
+                "retrieval_failed",
+                diagnostics,
+                allow_fallback=True,
+            )
 
         chunks = retrieval.get("chunks") or []
         if not chunks:
-            return self._fallback("no_chunks", diagnostics)
+            return self._fallback(
+                "no_chunks",
+                diagnostics,
+                allow_fallback=True,
+            )
 
         retrieval_confidence = retrieval_diag.get("retrieval_confidence", 0.0)
         if retrieval_confidence <= 0.05:
-            return self._fallback("retrieval_failed", diagnostics)
+            return self._fallback(
+                "retrieval_failed",
+                diagnostics,
+                allow_fallback=True,
+            )
 
         content_mix = retrieval_diag.get("content_mix", {})
 
-        # ---------------- CATEGORY GUARDS ----------------
-
+        # -------------------------------------------------
+        # CATEGORY GUARDS (DATA EXISTS → NO FALLBACK)
+        # -------------------------------------------------
         if category in OCR_FORBIDDEN_CATEGORIES and content_mix.get("ocr", 0) > 0:
-            return self._fallback("category_violation", diagnostics)
+            return self._fallback(
+                "category_violation",
+                diagnostics,
+                allow_fallback=False,
+            )
 
         if category in TABLE_REQUIRED_CATEGORIES and content_mix.get("table_row", 0) == 0:
-            return self._fallback("category_violation", diagnostics)
+            return self._fallback(
+                "category_violation",
+                diagnostics,
+                allow_fallback=False,
+            )
 
         if category in MANDATORY_TEXT_DOMINANCE:
             if (content_mix.get("text", 0) + content_mix.get("procedure", 0)) == 0:
-                return self._fallback("category_violation", diagnostics)
+                return self._fallback(
+                    "category_violation",
+                    diagnostics,
+                    allow_fallback=False,
+                )
 
-        # ---------------- PROMPT ----------------
+        # -------------------------------------------------
+        # PROMPT
+        # -------------------------------------------------
         prompt_bundle = self.prompt_builder.build(
             query=query,
-            retrieved_chunks=chunks
+            retrieved_chunks=chunks,
+            fast_mode=fast_mode,
         )
 
         if not prompt_bundle or not prompt_bundle.get("used_chunks"):
-            return self._fallback("no_chunks", diagnostics)
+            return self._fallback(
+                "no_chunks",
+                diagnostics,
+                allow_fallback=True,
+            )
 
-        # ---------------- ANSWER ----------------
+        # -------------------------------------------------
+        # ANSWER
+        # -------------------------------------------------
         answer_result = self.answer_generator.generate(prompt_bundle)
 
         hallucinated = answer_result.get("hallucinated", False)
@@ -138,9 +194,15 @@ class RAGPipeline:
         }
 
         if hallucinated:
-            return self._fallback("hallucination_detected", diagnostics)
+            return self._fallback(
+                "hallucination_detected",
+                diagnostics,
+                allow_fallback=False,
+            )
 
-        # ---------------- CONFIDENCE FUSION ----------------
+        # -------------------------------------------------
+        # CONFIDENCE FUSION
+        # -------------------------------------------------
         if fast_mode:
             final_confidence = round(
                 0.65 * retrieval_confidence +
@@ -163,7 +225,8 @@ class RAGPipeline:
             return self._fallback(
                 "low_final_confidence",
                 diagnostics,
-                confidence=final_confidence
+                confidence=final_confidence,
+                allow_fallback=False,   # 🔑 DATA EXISTS
             )
 
         return {
@@ -171,16 +234,20 @@ class RAGPipeline:
             "answer": answer_result.get("answer", ""),
             "confidence": final_confidence,
             "category": category,
+            "domain": domain,
             "diagnostics": diagnostics,
         }
 
-    # ---------------- FALLBACK ----------------
+    # =====================================================
+    # FALLBACK
+    # =====================================================
 
     def _fallback(
         self,
         reason: str,
         diagnostics: Optional[Dict],
         confidence: float = 0.0,
+        allow_fallback: bool = False,
     ) -> Dict:
 
         ux = NO_ANSWER_MESSAGES.get(
@@ -198,5 +265,9 @@ class RAGPipeline:
             "message": ux["message"],
             "suggestion": ux["suggestion"],
             "reason": reason,
+
+            # 🔑 CONTROL FLAG (API decides Gemini fallback)
+            "allow_fallback": allow_fallback,
+
             "diagnostics": diagnostics or {},
         }

@@ -27,6 +27,7 @@ def _hash_text(text: str) -> str:
 def _extract_header_footer_candidates(text: str) -> List[str]:
     """
     Extract top and bottom lines as header/footer candidates.
+    Ignore short section-like headings (e.g., 'Introduction').
     """
     if not text:
         return []
@@ -36,7 +37,20 @@ def _extract_header_footer_candidates(text: str) -> List[str]:
         return []
 
     candidates = lines[:HEADER_FOOTER_LINES] + lines[-HEADER_FOOTER_LINES:]
-    return [_normalize_line(c) for c in candidates if len(c) > 10]
+
+    cleaned: List[str] = []
+    for c in candidates:
+        c_norm = _normalize_line(c)
+
+        # 🔑 GUARD: ignore section-like headings
+        # short, alphabet-only lines like "introduction", "objectives"
+        if c_norm.replace(" ", "").isalpha() and len(c_norm.split()) <= 4:
+            continue
+
+        if len(c_norm) > 10:
+            cleaned.append(c_norm)
+
+    return cleaned
 
 
 # ---------------- MAIN LOADER ----------------

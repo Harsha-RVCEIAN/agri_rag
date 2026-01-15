@@ -1,0 +1,90 @@
+/* =====================================
+   Agri-Connect AI — Chat Components
+   ===================================== */
+
+/* ---------- Message Base ---------- */
+.message {
+  max-width: 85%;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+  line-height: 1.6;
+  animation: fadeInUp 0.25s ease;
+  word-wrap: break-word;
+}
+
+/* ---------- User Message ---------- */
+.message.user {
+  align-self: flex-end;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+/* ---------- Bot Message ---------- */
+.message.bot {
+  align-self: flex-start;
+  background: #f9fafb;
+  color: var(--text-main);
+  border-left: 4px solid var(--secondary);
+  border-bottom-left-radius: 4px;
+}
+
+/* ---------- Thinking / Loading ---------- */
+.message.bot.loading {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* ---------- Markdown Styling Inside Bot ---------- */
+.message.bot h1,
+.message.bot h2,
+.message.bot h3 {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  color: var(--primary);
+}
+
+.message.bot p {
+  margin: 6px 0;
+}
+
+.message.bot ul {
+  padding-left: 20px;
+  margin: 6px 0;
+}
+
+.message.bot li {
+  margin-bottom: 4px;
+}
+
+.message.bot strong {
+  font-weight: 600;
+}
+
+.message.bot code {
+  background: #eef2f7;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+/* ---------- Warning / No Answer ---------- */
+.message.bot.warning {
+  background: var(--warning-bg);
+  color: var(--danger);
+  border-left: 4px solid var(--danger);
+  font-weight: 600;
+}
+
+/* ---------- Fade Animation ---------- */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

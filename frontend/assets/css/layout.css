@@ -1,0 +1,97 @@
+/* =====================================
+   Agri-Connect AI — Layout System
+   ===================================== */
+
+/* ---------- Page Layout ---------- */
+body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg-gradient);
+}
+
+/* ---------- Main App Container ---------- */
+.chat-box {
+  width: 100%;
+  max-width: 900px;
+  display: flex;
+  flex-direction: column;
+  padding: 28px;
+  background: var(--card-bg);
+  backdrop-filter: blur(12px);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+/* ---------- Header ---------- */
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.header h1 {
+  font-size: 24px;
+  margin: 0;
+  color: var(--primary);
+}
+
+.header p {
+  font-size: 14px;
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* ---------- Chat Area ---------- */
+.answer-box {
+  flex: 1;
+  margin-top: 20px;
+  padding-right: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+}
+
+/* ---------- Input Area ---------- */
+.input-area {
+  margin-top: 18px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.input-area textarea {
+  flex: 1;
+}
+
+/* ---------- Footer / Meta ---------- */
+.meta {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 640px) {
+  .chat-box {
+    padding: 20px;
+  }
+
+  .header h1 {
+    font-size: 20px;
+  }
+
+  .input-area {
+    flex-direction: column;
+  }
+
+  .input-area button {
+    width: 100%;
+    height: 44px;
+  }
+}

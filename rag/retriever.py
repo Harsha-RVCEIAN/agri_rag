@@ -1,7 +1,9 @@
 from typing import List, Dict, Optional
 from collections import Counter, defaultdict
 
-# ---------------- CONFIG ----------------
+# =========================================================
+# CONFIG
+# =========================================================
 
 DEFAULT_TOP_K = 6
 OVERFETCH_K = 30
@@ -13,6 +15,8 @@ MAX_MERGED_CANDIDATES = 50
 
 MAX_CHUNKS_PER_PAGE = 2
 MAX_CHUNKS_PER_SOURCE = 3
+
+MIN_METADATA_CONFIDENCE = 0.25   # 🔑 hard floor
 
 CONTENT_TYPE_WEIGHT = {
     "table_row": 1.35,
@@ -31,20 +35,26 @@ SINGLE_SOURCE_PENALTY = 0.85
 SINGLE_PAGE_PENALTY = 0.90
 
 
+# =========================================================
+# RETRIEVER
+# =========================================================
+
 class Retriever:
     """
     Evidence-first retriever.
 
-    CONTRACT (STRICT):
-    - Accepts EMBEDDINGS ONLY
+    STRICT CONTRACT:
+    - Accepts embeddings ONLY
     - Never embeds text
-    - Never sees raw query strings
+    - Never depends on raw query text
     """
 
     def __init__(self, vector_store):
         self.vector_store = vector_store
 
-    # ---------- NORMALIZATION ----------
+    # -----------------------------------------------------
+    # NORMALIZATION
+    # -----------------------------------------------------
 
     def _normalize(self, matches: List[Dict]) -> None:
         scores = [m["score"] for m in matches]
@@ -60,7 +70,9 @@ class Retriever:
         for m in matches:
             m["norm_score"] = (m["score"] - lo) / denom
 
-    # ---------- SCORE ADJUSTMENT ----------
+    # -----------------------------------------------------
+    # SCORE ADJUSTMENT
+    # -----------------------------------------------------
 
     def _adjust(self, m: Dict) -> float:
         meta = m["metadata"]
@@ -82,7 +94,9 @@ class Retriever:
 
         return score
 
-    # ---------- INTENT CONSTRAINT ----------
+    # -----------------------------------------------------
+    # INTENT CONSTRAINT
+    # -----------------------------------------------------
 
     def _enforce_intent(
         self,
@@ -100,19 +114,29 @@ class Retriever:
 
         return None
 
-    # ---------- MAIN RETRIEVAL ----------
+    # -----------------------------------------------------
+    # MAIN RETRIEVAL
+    # -----------------------------------------------------
 
     def retrieve(
         self,
-        query: str,
         query_vectors: List[List[float]],
         intent: Optional[str] = None,
         language: Optional[str] = None,
+        domain: Optional[str] = None,
         top_k: int = DEFAULT_TOP_K,
     ) -> Dict:
 
-        filters = {"language": {"$eq": language}} if language else None
+        # ---------- FILTERS ----------
+        filters = {}
+        if language:
+            filters["language"] = {"$eq": language}
+        if domain:
+            filters["domain"] = {"$eq": domain}
 
+        filters = filters or None
+
+        # ---------- QUERY ----------
         raw: List[Dict] = []
         for vec in query_vectors:
             res = self.vector_store.query(
@@ -126,10 +150,19 @@ class Retriever:
         if not raw:
             return {
                 "chunks": [],
-                "diagnostics": {
-                    "status": "fail",
-                    "reason": "no_matches",
-                },
+                "diagnostics": {"status": "fail", "reason": "no_matches"},
+            }
+
+        # ---------- HARD CONFIDENCE FLOOR ----------
+        raw = [
+            m for m in raw
+            if m["metadata"].get("confidence", 1.0) >= MIN_METADATA_CONFIDENCE
+        ]
+
+        if not raw:
+            return {
+                "chunks": [],
+                "diagnostics": {"status": "fail", "reason": "all_low_confidence"},
             }
 
         # ---------- NORMALIZE ----------
@@ -179,7 +212,7 @@ class Retriever:
                 "source": source,
                 "page": page,
                 "confidence": meta.get("confidence"),
-                "text": meta.get("text", ""),
+                "text": m.get("text", ""),   # 🔑 FIXED
             })
 
             if len(ranked) >= top_k * 2:
@@ -188,10 +221,7 @@ class Retriever:
         if len(ranked) < MIN_COVERAGE_CHUNKS:
             return {
                 "chunks": [],
-                "diagnostics": {
-                    "status": "fail",
-                    "reason": "insufficient_coverage",
-                },
+                "diagnostics": {"status": "fail", "reason": "insufficient_coverage"},
             }
 
         ranked.sort(key=lambda x: x["score"], reverse=True)
@@ -199,20 +229,14 @@ class Retriever:
         if ranked[0]["score"] < WEAK_RETRIEVAL_THRESHOLD:
             return {
                 "chunks": [],
-                "diagnostics": {
-                    "status": "fail",
-                    "reason": "low_confidence",
-                },
+                "diagnostics": {"status": "fail", "reason": "low_confidence"},
             }
 
         intent_issue = self._enforce_intent(ranked, intent)
         if intent_issue:
             return {
                 "chunks": [],
-                "diagnostics": {
-                    "status": "fail",
-                    "reason": intent_issue,
-                },
+                "diagnostics": {"status": "fail", "reason": intent_issue},
             }
 
         # ---------- CONFIDENCE ----------
@@ -242,6 +266,7 @@ class Retriever:
             "diagnostics": {
                 "status": "ok",
                 "intent": intent,
+                "domain": domain,
                 "retrieval_confidence": retrieval_confidence,
                 "content_mix": dict(
                     Counter(c["content_type"] for c in top)

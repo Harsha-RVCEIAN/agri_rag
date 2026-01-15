@@ -12,6 +12,7 @@ from functools import lru_cache
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.responses import Response
 
 # ---------------- PATH SETUP ----------------
 
@@ -27,12 +28,25 @@ from ingestion.pipeline import ingest_pdf
 from embeddings.embedder import Embedder
 from embeddings.vector_store import VectorStore
 
+from nlp.language_detector import detect_language
+from nlp.translator import Translator
+from nlp.query_normalizer import normalize_query
+from nlp.glossary import apply_glossary
+
+from speech.stt import transcribe_audio
+from speech.tts import synthesize_speech
+from speech.confidence import (
+    validate_stt_result,
+)
+
+from speech.voice_validation import validate_answer_for_voice
+
 # ---------------- APP INIT ----------------
 
 app = FastAPI(
     title="Agri-RAG API",
-    description="Evidence-bound agricultural QA system",
-    version="2.2.2",
+    description="Evidence-bound agricultural QA system (Text + Voice)",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -86,42 +100,206 @@ def startup_event():
         vector_store=vector_store,
         embedder=embedder
     )
-    # 🔥 SINGLE Gemini instance
-    app.state.gemini_llm = LLMClient(provider="gemini")
 
-    print("✅ Agri-RAG API ready")
+    app.state.gemini_llm = LLMClient(provider="gemini")
+    app.state.translator = Translator(provider="gemini")
+
+    print("✅ Agri-RAG API ready (Text + Voice)")
 
 # ---------------- DOMAIN GUARDS ----------------
 
 AGRI_KEYWORDS = {
-    "agriculture", "farming", "crop", "soil", "fertilizer",
-    "rice", "wheat", "maize", "paddy", "tomato", "potato",
-    "organic", "irrigation", "yield", "harvest",
-    "scheme", "pm kisan", "pmfby", "insurance",
+     # core short prompt-style terms
+    "agri","agriculture","agro","agronomy","farm","farming","farmer","farm_ops",
+    "farm_sys","farm_mgmt","agri_mgmt","agri_sys","agri_data","agri_ai","agri_ml",
+    "agri_tech","agritech","smart_agri","digital_agri","precision_agri",
+
+    # land & soil
+    "soil","soil_health","soil_mgmt","soil_test","soil_fertility","soil_ph",
+    "soil_carbon","soil_water","soil_type","topsoil","subsoil","loam","clay",
+    "sand","silt","humus","organic_matter","soil_ecology","soil_microbes",
+    "soil_structure","soil_profile","soil_salinity","soil_erosion",
+
+    # water & irrigation
+    "water","irrigation","irrig_sys","irrig_mgmt","drip_irrig","sprinkler",
+    "flood_irrig","canal_irrig","rainfed","rainwater","water_cycle",
+    "water_use","water_efficiency","water_stress","groundwater",
+    "surface_water","watershed","drainage","mulch","mulching",
+
+    # land preparation
+    "tillage","plough","plowing","harrow","cultivator","rotavator",
+    "land_prep","seedbed","bed_prep","zero_till","no_till",
+    "min_till","conservation_till",
+
+    # crops (grains)
+    "crop","crops","crop_sys","crop_cycle","crop_yield","yield",
+    "rice","wheat","maize","corn","barley","oats","rye",
+    "millet","sorghum","quinoa","triticale",
+
+    # pulses & legumes
+    "pulse","pulses","legume","soybean","soy","groundnut","peanut",
+    "chickpea","lentil","pigeonpea","cowpea","mungbean","blackgram",
+    "fieldpea","drybean",
+
+    # oilseeds
+    "oilseed","mustard","canola","sunflower","sesame",
+    "linseed","safflower","castor","nigerseed",
+
+    # tubers & roots
+    "tuber","root_crop","potato","sweetpotato","cassava",
+    "yam","taro","beetroot","radish","carrot",
+
+    # vegetables
+    "veg","vegetable","tomato","onion","garlic","chili",
+    "capsicum","brinjal","eggplant","okra","cucumber",
+    "pumpkin","gourd","bittergourd","bottlegourd",
+    "zucchini","spinach","lettuce","cabbage","cauliflower",
+    "broccoli","kale",
+
+    # fruits
+    "fruit","orchard","horticulture","mango","banana",
+    "apple","grape","orange","lemon","lime","guava",
+    "papaya","pineapple","watermelon","muskmelon",
+    "pear","peach","plum","pomegranate","fig",
+    "date","coconut","arecanut","cashew","almond",
+    "walnut","pistachio",
+
+    # seeds & planting
+    "seed","seedling","nursery","planting","sowing",
+    "broadcast","transplant","direct_seed","seed_rate",
+    "seed_treat","seed_quality","hybrid_seed",
+    "op_seed","germination","viability","seed_bank",
+
+    # nutrients & fertilizers
+    "nutrient","plant_nutrition","fertilizer","fert",
+    "chemical_fert","organic_fert","biofert",
+    "npk","nitrogen","phosphorus","potassium",
+    "urea","dap","mop","ssp","micronutrient",
+    "zinc","iron","boron","copper","manganese",
+    "sulphur","manure","fym","compost",
+    "vermicompost","green_manure",
+
+    # pests
+    "pest","pests","insect","insects","aphid","whitefly",
+    "thrips","bollworm","stem_borer","leaf_folder",
+    "armyworm","cutworm","mite","nematode",
+    "rodent","bird_damage",
+
+    # diseases
+    "disease","plant_disease","fungal_disease",
+    "bacterial_disease","viral_disease",
+    "blight","rust","smut","wilt",
+    "powdery_mildew","downy_mildew",
+    "leaf_spot","root_rot","stem_rot",
+    "anthracnose","mosaic_virus",
+
+    # weeds
+    "weed","weeds","weed_mgmt","weeding",
+    "manual_weeding","mechanical_weeding",
+    "chemical_weeding","herbicide",
+    "pre_emergence","post_emergence",
+    "glyphosate","atrazine","pendimethalin","two_four_d",
+
+    # protection
+    "pesticide","insecticide","fungicide",
+    "spray","sprayer","knapsack_sprayer",
+    "power_sprayer","dose","resistance",
+    "ipm","integrated_pest_mgmt",
+    "biocontrol","biopesticide",
+    "pheromone_trap",
+
+    # climate
+    "climate","weather","climate_change",
+    "rainfall","temperature","humidity",
+    "drought","flood","heat_stress",
+    "cold_stress","frost","hailstorm",
+
+    # technology
+    "precision_farming","smart_farming",
+    "remote_sensing","satellite_data",
+    "gis","gps","drone","agri_drone",
+    "yield_map","variable_rate",
+    "decision_support","farm_analytics",
+    "iot_agri","sensor","soil_sensor",
+    "weather_station",
+
+    # machinery
+    "mechanization","tractor","plough_tool",
+    "seed_drill","planter","reaper",
+    "harvester","combine","thresher",
+    "baler","irrig_pump","diesel_pump",
+    "electric_pump",
+
+    # livestock
+    "livestock","animal_husbandry","dairy",
+    "milk","cow","buffalo","goat","sheep",
+    "pig","poultry","chicken","duck",
+    "feed","fodder","silage","hay",
+    "breeding","ai_breeding",
+    "veterinary","animal_health",
+
+    # systems & sustainability
+    "organic_farming","natural_farming",
+    "zbnf","sustainable_agri",
+    "regenerative_agri","agroecology",
+    "agroforestry","permaculture",
+    "mixed_farming","crop_rotation",
+    "intercropping","monocrop",
+    "cover_crop",
+
+    # protected cultivation
+    "greenhouse","polyhouse","shade_net",
+    "protected_cultivation",
+    "hydroponics","aeroponics",
+    "aquaponics","vertical_farming",
+
+    # post-harvest
+    "post_harvest","storage","cold_storage",
+    "warehouse","grading","sorting",
+    "packaging","processing","value_add",
+    "shelf_life","food_loss","food_waste",
+
+    # economics & policy
+    "agri_economics","farm_economics",
+    "cost_of_cultivation","input_cost",
+    "output_price","market","mandi",
+    "auction","msp","minimum_support_price",
+    "supply_chain","logistics","export",
+    "import","agribusiness",
+
+    # farmer & institutions
+    "farmer","smallholder","marginal_farmer",
+    "tenant_farmer","fpo","cooperative",
+    "extension","agri_extension",
+    "training","capacity_building",
+
+    # food system
+    "food_security","nutrition","food_system",
+    "food_chain","food_processing",
+    "food_safety","quality_control",
+    "traceability","certification",
+
+    # research & biotech
+    "agri_research","plant_breeding",
+    "genetics","genomics","hybridization",
+    "mutation_breeding","biotech",
+    "gm_crop","crispr","tissue_culture",
+    "micropropagation"
 }
 
-PERSON_PATTERNS = (
-    r"\bwho is\b", r"\bbiography\b", r"\bborn\b",
-    r"\bage\b", r"\bnet worth\b"
-)
-
-DEFINITION_TRIGGERS = (
-    "what is", "define", "definition of", "meaning of", "explain"
-)
-
-def is_agriculture_query(q: str) -> bool:
-    return any(k in q.lower() for k in AGRI_KEYWORDS)
+PERSON_PATTERNS = (r"\bwho is\b", r"\bbiography\b", r"\bborn\b", r"\bage\b", r"\bnet worth\b")
+DEFINITION_TRIGGERS = ("what is", "define", "definition of", "meaning of", "explain")
 
 def looks_like_person_query(q: str) -> bool:
     return any(re.search(p, q.lower()) for p in PERSON_PATTERNS)
 
 def is_definition_query(q: str) -> bool:
-    q = q.lower().strip()
-    return any(q.startswith(t) for t in DEFINITION_TRIGGERS)
+    q = q.lower()
+    return any(t in q for t in DEFINITION_TRIGGERS)
+
 
 # ---------------- RAG CACHE ----------------
 
-@lru_cache(maxsize=512)
 def cached_rag_answer(
     question: str,
     intent: Optional[str],
@@ -157,99 +335,199 @@ class ChatResponse(BaseModel):
 def health():
     return {"status": "ok"}
 
-# ---------------- CHAT ----------------
+# ============================================================
+# TEXT CHAT (UNCHANGED)
+# ============================================================
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-
     raw = req.question.strip()
     if not raw:
         raise HTTPException(400, "Empty question")
 
-    if looks_like_person_query(raw):
+    lang_info = detect_language(raw)
+    translation_in = app.state.translator.to_english(raw, lang_info)
+
+    if not translation_in["success"]:
+        return ChatResponse(
+            status="no_answer",
+            answer=None,
+            confidence=0.0,
+            message="Unable to understand the question language.",
+        )
+
+    english_query = apply_glossary(translation_in["text"])
+    norm = normalize_query(english_query)
+
+    # ================= DEFINITIONS (STRICT) =================
+    # ================= DEFINITIONS (GENERAL & SAFE) =================
+    if is_definition_query(english_query) and len(english_query.split()) <= 15:
+        answer_en = app.state.gemini_llm.generate(
+            system_prompt=(
+                "SYSTEM ROLE: Agricultural Information Assistant.\n\n"
+                "RULES:\n"
+                "1. Answer clearly and concisely.\n"
+                "2. Provide a short and complete summary donot give half answers,  not long explanations.\n"
+                "3. If listing points, include all key points briefly.\n"
+                "4. Do NOT repeat ideas or add filler text.\n"
+                "5. Stop when the answer is logically complete.\n"
+                "6. Never stop at mid-sentence or mid-thought.\n"
+                "7. if it is extending token limit , then pick till its previous sentence and display it. \n"
+                "8.Give a clear, factual definition.\n"
+                "9.No advice. No recommendations."
+            ),
+            user_prompt=english_query,
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        translation_out = app.state.translator.from_english(
+            answer_en,
+            lang_info
+        )
+
+        final_answer = (
+            translation_out["text"]
+            if translation_out["success"]
+            else answer_en
+        )
+
+        return ChatResponse(
+            status="answer",
+            answer=final_answer,
+            confidence=0.7,
+            diagnostics={"category": "definition"}
+        )
+
+    if not norm["is_agriculture_related"]:
         return ChatResponse(
             status="no_answer",
             answer=None,
             confidence=0.0,
             message="This system answers agriculture-related questions only.",
-            suggestion="Ask about crops, farming practices, or schemes."
         )
 
-    if not is_agriculture_query(raw):
-        return ChatResponse(
-            status="no_answer",
-            answer=None,
-            confidence=0.0,
-            message="This system is limited to agriculture topics.",
-            suggestion="Rephrase with an agriculture focus."
-        )
-
-    # ================= DEFINITIONS (GEMINI ONLY) =================
-    if is_definition_query(raw):
-        answer = app.state.gemini_llm.generate(
-            system_prompt=(
-                "You are an agricultural expert.\n"
-                "Give a clear, textbook-style definition.\n"
-                "No advice. No recommendations."
-            ),
-            user_prompt=raw,
-            temperature=0.3,
-            max_tokens=500,
-        )
-
-        # 🔥 NEVER ERROR — ALWAYS RETURN TEXT
-        return ChatResponse(
-            status="answer",
-            answer=answer or "Definition not available at the moment.",
-            confidence=0.7,
-            diagnostics={"category": "definition"}
-        )
+    normalized_query = norm["normalized_query"]
 
     # ================= RAG =================
     result = cached_rag_answer(
-        raw,
+        normalized_query,
         req.intent,
-        req.language,
-        req.category
+        "en",
+        req.category,
     )
 
     if result.get("status") == "answer":
-        return ChatResponse(
-            status="answer",
-            answer=result.get("answer"),
-            confidence=result.get("confidence", 0.0),
-            diagnostics=result.get("diagnostics")
+        translation_out = app.state.translator.from_english(
+            result["answer"],
+            lang_info
         )
 
-    # ================= GEMINI FALLBACK =================
-    fallback = app.state.gemini_llm.generate(
-        system_prompt="You are an agricultural expert.",
-        user_prompt=raw,
-        temperature=0.3,
-        max_tokens=350,
-    )
+        final_answer = (
+            translation_out["text"]
+            if translation_out["success"]
+            else result["answer"]
+        )
 
-    if fallback:
         return ChatResponse(
             status="answer",
-            answer=fallback,
-            confidence=0.6,
-            diagnostics={"fallback": "gemini"}
+            answer=final_answer,
+            confidence=result["confidence"],
+            diagnostics=result.get("diagnostics"),
+        )
+
+    # ================= GLOBAL GEMINI FALLBACK =================
+    fallback_en = app.state.gemini_llm.generate(
+        system_prompt=(
+                "SYSTEM ROLE: Agricultural Information Assistant.\n\n"
+                "RULES:\n"
+                "1. Answer clearly and concisely.\n"
+                "2. Provide a short and complete summary donot give half answers,  not long explanations.\n"
+                "3. If listing points, include all key points briefly.\n"
+                "4. Do NOT repeat ideas or add filler text.\n"
+                "5. Stop when the answer is logically complete.\n"
+                "6. Never stop at mid-sentence or mid-thought.\n"
+                "7. if it is extending token limit , then pick till its previous sentence and display it. \n"
+                "8.Give a clear, factual definition.\n"
+                "9.No advice. No recommendations."
+                "10.for questions in which they ask price , location specific or generatl market related , give then current price,don't stop before that."
+            ),
+        user_prompt=english_query,
+        temperature=0.3,
+        max_tokens=400,
+    )
+
+    if fallback_en:
+        translation_out = app.state.translator.from_english(
+            fallback_en,
+            lang_info
+        )
+
+        final_answer = (
+            translation_out["text"]
+            if translation_out["success"]
+            else fallback_en
+        )
+
+        return ChatResponse(
+            status="answer",
+            answer=final_answer,
+            confidence=0.55,
+            diagnostics={
+                "fallback": "gemini",
+                "rag_status": result.get("status"),
+                "rag_reason": result.get("reason"),
+            },
         )
 
     return ChatResponse(
         status="no_answer",
         answer=None,
         confidence=0.0,
-        message="Unable to answer with available information.",
-        suggestion="Try rephrasing or upload relevant documents."
+        message="I’m designed to answer agriculture questions. Please ask something related to crops, farming, or schemes.",
     )
+
+
+# ============================================================
+# VOICE CHAT (NEW)
+# ============================================================
+
+@app.post("/chat/voice")
+def chat_voice(file: UploadFile = File(...)):
+    audio_bytes = file.file.read()
+
+    # -------- STT ONLY --------
+    stt_result = transcribe_audio(audio_bytes, file.filename)
+
+    stt_check = validate_stt_result(stt_result)
+
+    if not stt_check["is_valid"]:
+        return {
+            "status": "no_answer",
+            "text": None,
+            "confidence": 0.0,
+            "message": (
+                "I couldn’t hear clearly. "
+                "Please hold the mic for at least 2 seconds and speak clearly."
+            ),
+            "diagnostics": {
+                "stt_reason": stt_check["reason"]
+            }
+        }
+
+    # ✅ SUCCESS → RETURN TEXT ONLY
+    return {
+        "status": "stt_success",
+        "text": stt_result["text"],
+        "language": stt_result.get("language"),
+        "confidence": stt_result.get("confidence"),
+    }
+
 
 # ---------------- PDF UPLOAD ----------------
 
 @app.post("/upload-pdf")
 def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files allowed")
 
@@ -259,8 +537,6 @@ def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
 
     background_tasks.add_task(ingest_pdf_background, path)
     return {"status": "accepted", "file": file.filename}
-
-# ---------------- INGEST ----------------
 
 def ingest_pdf_background(pdf_path: str):
     state = _load_state()

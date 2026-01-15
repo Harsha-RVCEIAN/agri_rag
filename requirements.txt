@@ -1,32 +1,40 @@
-# ---------------- Core Python ----------------
-numpy
-typing-extensions
+# ---------------- CORE ----------------
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+typing-extensions>=4.8.0
 
-# ---------------- PDF Processing ----------------
-pdfplumber
-PyMuPDF
+# ---------------- API ----------------
+fastapi>=0.110.0
+uvicorn>=0.25.0
+
+# ---------------- PDF PROCESSING ----------------
+pdfplumber>=0.10.3
+PyMuPDF>=1.23.7
 
 # ---------------- OCR ----------------
-opencv-python
-pytesseract
-Pillow
+pytesseract>=0.3.10
+opencv-python>=4.8.1.78
+numpy>=1.24.0
 
-# ---------------- Language Detection ----------------
-langdetect
+# ---------------- TABLE EXTRACTION ----------------
+camelot-py[cv]>=0.11.0
+ghostscript>=0.7
 
-# ---------------- Embeddings ----------------
-torch
-transformers
-sentence-transformers
+# ---------------- NLP / ML ----------------
+torch>=2.0.0
+transformers>=4.36.0
+sentencepiece>=0.1.99
 
-# ---------------- Vector Database ----------------
-pinecone-client
+# ---------------- EMBEDDINGS & VECTOR STORE ----------------
+pinecone-client>=3.0.0
 
-# ---------------- Backend / API ----------------
-fastapi
-uvicorn
-pydantic
+# ---------------- UTILITIES ----------------
+requests>=2.31.0
+tqdm>=4.66.0
 
-# ---------------- Utilities ----------------
-python-dotenv
-tqdm
+# ---------------- GOOGLE GEMINI ----------------
+google-generativeai>=0.3.2
+
+#---------------- LANGUAGE DETECTION ----------------  
+langdetect==1.0.9
+
